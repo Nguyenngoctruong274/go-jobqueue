@@ -1,0 +1,37 @@
+# `docker compose up -d` starts only PostgreSQL, for local development and
+# tests. `docker compose --profile stack up --build` also runs jobqueued.
+# Credentials here are for local use only.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+      POSTGRES_DB: jobs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs -d jobs"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  jobqueued:
+    profiles: ["stack"]
+    build: .
+    environment:
+      JQ_DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs?sslmode=disable
+      JQ_LOG_LEVEL: info
+      JQ_SHUTDOWN_DRAIN: 2s
+    ports:
+      - "8080:8080"
+    stop_grace_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
