@@ -55,6 +55,7 @@ built so far.
 |---|---|
 | `cmd/jobqueued` | Service wiring, graceful shutdown |
 | `internal/config` | Environment configuration with validation |
+| `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
 | `internal/httpapi` | Probes; job endpoints from day 7 |
 | `internal/postgres` | Connection pool; schema and queue operations from day 3 |
 
@@ -93,10 +94,64 @@ the database URL (it holds a password).
 - On `SIGTERM`: readiness turns 503, the service waits `JQ_SHUTDOWN_DRAIN`,
   then shuts the HTTP server down within `JQ_SHUTDOWN_TIMEOUT`.
 
+## Job lifecycle
+
+`internal/job` defines the rules every other part of the queue follows. It
+does no I/O, so the rules are tested exhaustively on their own (every
+operation from every state, plus fuzzing of arbitrary operation sequences).
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: enqueue
+    pending --> running: claim (RunAt reached, attempt += 1, lease)
+    running --> running: heartbeat (extends the lease)
+    running --> succeeded: succeed
+    running --> pending: fail / lease expired, attempts left (RunAt = now + backoff)
+    running --> dead: fail / lease expired, no attempts left, or permanent error
+    pending --> cancelled: cancel
+    dead --> pending: requeue (fresh attempts)
+    succeeded --> [*]
+    cancelled --> [*]
+```
+
+- **The attempt number is a fencing token.** `Claim` returns it, and
+  `Heartbeat`, `Succeed` and `Fail` must present it. If a worker stalls,
+  its lease expires and another worker claims the job, the stalled worker
+  comes back holding a stale token and gets `ErrLeaseLost`: it cannot
+  complete or fail somebody else's attempt.
+- **A lost lease is a failed attempt.** The reaper's `Expire` follows the
+  same retry rule as `Fail`, so a job that crashes its worker every time
+  still dies after `MaxAttempts` instead of looping forever.
+- **Permanent errors skip the retries.** A handler returns
+  `job.Permanent(err)` for failures that cannot succeed later (a payload
+  that does not parse); the job goes straight to `dead`.
+- **Stored errors are bounded.** `LastError` is valid UTF-8 without NUL
+  bytes (PostgreSQL `text` rejects both) and at most 2 KiB, cut on a rune
+  boundary.
+
+### Retry backoff
+
+After attempt *n* fails, the job waits a delay drawn from
+`[ceiling × (1 − jitter), ceiling]`, where
+`ceiling = min(Max, Base × 2^(n−1))`.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `Base` | `1s` | Ceiling after the first failure |
+| `Max` | `1h` | Ceiling never grows past it |
+| `JitterPercent` | `50` | Share of the ceiling randomized away; `100` is "full jitter" |
+
+With the defaults, attempts 1 to 5 wait 0.5–1s, 1–2s, 2–4s, 4–8s and
+8–16s. Half-jitter keeps jobs that failed together (say, during a
+downstream outage) from retrying in lockstep, while still guaranteeing
+each retry waits at least half its ceiling. The arithmetic is integer
+nanoseconds and cannot overflow for any attempt count; fuzzing checks the
+bounds above for arbitrary settings.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
-- [ ] **Day 2**: Job domain: state machine, retry policy (exponential backoff + jitter); table tests and fuzzing
+- [x] **Day 2**: Job domain: state machine, retry policy (exponential backoff + jitter); table tests and fuzzing
 - [ ] **Day 3**: Schema and migrations; enqueue with idempotency key, priority and delayed jobs
 - [ ] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
 - [ ] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
