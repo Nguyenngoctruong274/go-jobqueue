@@ -57,7 +57,7 @@ built so far.
 | `internal/config` | Environment configuration with validation |
 | `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
 | `internal/httpapi` | Probes; job endpoints from day 7 |
-| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get) |
+| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, claim) |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -194,12 +194,59 @@ fails loudly instead of storing a job the domain could never produce. The
 claim index `(priority DESC, run_at, id) WHERE state = 'pending'` holds
 only pending jobs, so finished ones piling up do not slow claiming down.
 
+## Claiming
+
+`Store.Claim(ctx, ClaimRequest{Types, Limit, Lease})` starts the next
+attempt of up to `Limit` due jobs (1 to 1000) and returns them in claim
+order: highest priority, then earliest `run_at`, then id. `Types` limits it
+to the job types a worker has handlers for. Each job comes back `running`,
+its `attempt` incremented, under a lease ending at the database's `now()`
+plus `Lease`. An empty queue returns an empty slice, not an error.
+
+```sql
+WITH due AS (
+    SELECT id FROM jobs
+    WHERE state = 'pending' AND run_at <= now()
+      AND ($3::text[] IS NULL OR type = ANY($3))
+    ORDER BY priority DESC, run_at, id
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs SET state = 'running', attempt = attempt + 1,
+       lease_until = now() + $2 * interval '1 microsecond', updated_at = now()
+WHERE id IN (SELECT id FROM due)
+RETURNING ...
+```
+
+- **One worker per attempt.** A row that another transaction is claiming
+  is skipped, not waited for; once that transaction commits the row is
+  `running` and no longer matches. Workers never block each other and
+  never get the same attempt.
+- **Cheap at any table size.** The plan walks the partial index
+  `jobs_claim` in claim order and stops after `Limit` lockable rows. On
+  200,000 jobs (20,000 pending) a batch of 10 reads exactly 10 index
+  entries and runs in 0.33 ms.
+- **Same rules as the domain.** A test claims a job through SQL and
+  through `job.Job.Claim` and checks the two agree, down to the lease end.
+- **One clock.** Due-ness and lease ends use the database's `now()`, so
+  workers with skewed clocks still agree on what is due.
+
+Tests that back this up:
+
+| Test | What it proves |
+|---|---|
+| `TestClaimEachJobOnceUnderContention` | 16 workers drain 2,000 jobs with random batch sizes: every job claimed exactly once, all at attempt 1 |
+| `TestClaimWhileProducersEnqueue` | 4 producers enqueue while 8 workers claim: no job lost or handed out twice |
+| `TestClaimSkipsLockedRowsInsteadOfWaiting` | With the best job locked by another transaction, Claim returns the next one at once, and the locked job is claimable after release |
+| `TestClaimTakesDueJobsInOrder` | Batches follow priority, `run_at`, id; jobs whose `run_at` is in the future are not claimed |
+| `TestClaimSkipsJobsThatAreNotPending` | Running, succeeded, dead and cancelled jobs are never claimed |
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
 - [x] **Day 2**: Job domain: state machine, retry policy (exponential backoff + jitter); table tests and fuzzing
 - [x] **Day 3**: Schema and migrations; enqueue with idempotency key, priority and delayed jobs
-- [ ] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
+- [x] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
 - [ ] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
 - [ ] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
 - [ ] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
