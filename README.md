@@ -57,7 +57,8 @@ built so far.
 | `internal/config` | Environment configuration with validation |
 | `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
 | `internal/httpapi` | Probes; job endpoints from day 7 |
-| `internal/postgres` | Connection pool; schema and queue operations from day 3 |
+| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get) |
+| `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
 
@@ -68,6 +69,9 @@ curl localhost:8080/healthz   # {"status":"ok"}
 curl localhost:8080/readyz    # {"status":"ready"}; 503 if PostgreSQL is down
 make test-db     # unit tests + tests against the real PostgreSQL
 ```
+
+jobqueued applies pending migrations at startup, under an advisory lock so
+that several instances starting together migrate once.
 
 Or run everything in containers: `make stack`.
 
@@ -148,11 +152,53 @@ each retry waits at least half its ceiling. The arithmetic is integer
 nanoseconds and cannot overflow for any attempt count; fuzzing checks the
 bounds above for arbitrary settings.
 
+## Enqueueing
+
+`Store.Enqueue(ctx, job.Spec)` validates the spec, inserts a pending job
+and returns it with `created = true`.
+
+| Field | Rule | Default |
+|---|---|---|
+| `Type` | `^[a-z0-9][a-z0-9._-]{0,127}$`, selects the handler | required |
+| `Payload` | JSON, at most 1 MiB; stored as `jsonb` | `{}` |
+| `Priority` | `-100` to `100`; higher runs first | `0` |
+| `MaxAttempts` | `1` to `100` | `5` |
+| `RunAt` | delays the job until then | now (database clock) |
+| `IdempotencyKey` | up to 200 bytes of UTF-8, unique per `Type` | none |
+
+Invalid specs fail with `job.ErrInvalidSpec`, listing every bad field. That
+includes payloads `encoding/json` accepts but `jsonb` does not (`\u0000`,
+lone surrogates): the store maps PostgreSQL's refusal to the same error.
+
+**Idempotency keys.** A producer that times out does not know whether its
+enqueue landed, so it retries with the same key:
+
+- Same type and key, same payload, priority and attempt limit (`RunAt` is
+  ignored, since a retry recomputes "in 5 minutes"): the existing job is
+  returned with `created = false`, whatever its state.
+- Same type and key but different parameters: `job.ErrIdempotencyConflict`,
+  because the key was reused for different work.
+- The key stays taken for as long as the row exists, so a finished job is
+  never run again by a late retry.
+
+The insert is `ON CONFLICT DO NOTHING` against a partial unique index on
+`(type, idempotency_key)`. When it conflicts, a second statement reads the
+row holding the key: the first statement's snapshot predates the winner's
+commit and cannot see it. A test races 40 producers on one key and checks
+that exactly one creates the job and all get its id back.
+
+**Schema.** The `jobs` table restates the state machine's invariants as
+`CHECK` constraints (a lease exactly while running, `attempt` within
+`max_attempts`, no pending job without attempts left), so a buggy query
+fails loudly instead of storing a job the domain could never produce. The
+claim index `(priority DESC, run_at, id) WHERE state = 'pending'` holds
+only pending jobs, so finished ones piling up do not slow claiming down.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
 - [x] **Day 2**: Job domain: state machine, retry policy (exponential backoff + jitter); table tests and fuzzing
-- [ ] **Day 3**: Schema and migrations; enqueue with idempotency key, priority and delayed jobs
+- [x] **Day 3**: Schema and migrations; enqueue with idempotency key, priority and delayed jobs
 - [ ] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
 - [ ] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
 - [ ] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
