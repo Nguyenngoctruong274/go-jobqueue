@@ -102,8 +102,13 @@ func (s *Store) Get(ctx context.Context, id int64) (job.Job, error) {
 	return j, nil
 }
 
+// scanner is satisfied by *sql.Row and *sql.Rows.
+type scanner interface {
+	Scan(dest ...any) error
+}
+
 // scanJob reads jobColumns, then any extra destinations, from row.
-func scanJob(row *sql.Row, extra ...any) (job.Job, error) {
+func scanJob(row scanner, extra ...any) (job.Job, error) {
 	var (
 		j          job.Job
 		state      string
