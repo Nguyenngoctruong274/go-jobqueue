@@ -49,6 +49,11 @@ func run() error {
 		return err
 	}
 	defer db.Close()
+	// Instances starting together serialize on an advisory lock, so the
+	// schema is migrated once and nobody serves before it is current.
+	if err := postgres.Migrate(startCtx, db); err != nil {
+		return err
+	}
 	logger.Info("database ready", slog.Int("max_conns", cfg.DBMaxConns))
 
 	// Readiness turns false the moment shutdown starts, so load balancers
