@@ -67,10 +67,13 @@ var errLeaseExpired = errors.New("lease expired before the attempt finished")
 // and its report is rejected with ErrLeaseLost instead of overwriting the
 // new attempt.
 type Job struct {
-	ID      int64
-	Type    string
+	ID   int64
+	Type string
+	// Payload is the handler's input, a JSON document.
 	Payload []byte
 	State   State
+	// Priority orders due jobs: higher runs first.
+	Priority int
 	// Attempt counts started attempts; it is the token of the current one
 	// while the job runs.
 	Attempt     int
@@ -81,6 +84,10 @@ type Job struct {
 	LeaseUntil time.Time
 	// LastError is the failure of the latest failed attempt, if any.
 	LastError string
+	// IdempotencyKey, if set, makes enqueueing the same job again return
+	// this one instead of a duplicate.
+	IdempotencyKey string
+	CreatedAt      time.Time
 }
 
 // Claim starts the next attempt of a due pending job under a lease that
