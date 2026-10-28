@@ -57,7 +57,8 @@ built so far.
 | `internal/config` | Environment configuration with validation |
 | `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
 | `internal/httpapi` | Probes; job endpoints from day 7 |
-| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, claim) |
+| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, claim, succeed, fail, heartbeat, reap, cancel, requeue) |
+| `internal/reaper` | Timer loop that returns silent workers' jobs to the queue |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -85,6 +86,7 @@ Or run everything in containers: `make stack`.
 | `JQ_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `JQ_SHUTDOWN_TIMEOUT` | `15s` | Maximum time to finish in-flight requests |
 | `JQ_SHUTDOWN_DRAIN` | `0` | Time `/readyz` reports 503 before the listener closes |
+| `JQ_REAP_INTERVAL` | `5s` | How often expired leases are swept (at least `100ms`) |
 
 Invalid configuration is reported all at once at startup, without echoing
 the database URL (it holds a password).
@@ -241,13 +243,60 @@ Tests that back this up:
 | `TestClaimTakesDueJobsInOrder` | Batches follow priority, `run_at`, id; jobs whose `run_at` is in the future are not claimed |
 | `TestClaimSkipsJobsThatAreNotPending` | Running, succeeded, dead and cancelled jobs are never claimed |
 
+## Finishing, failing and reaping
+
+A worker ends the attempt it holds with its fencing token, the `attempt`
+number `Claim` returned:
+
+```go
+err := store.Succeed(ctx, j.ID, j.Attempt)
+j, err = store.Fail(ctx, j.ID, j.Attempt, err)              // retry or die
+err = store.Heartbeat(ctx, j.ID, j.Attempt, 30*time.Second) // for long handlers
+```
+
+Every transition runs the same way: lock the row (`SELECT … FOR UPDATE`),
+read the database clock, apply the rule from `internal/job`, write the
+row back, commit. The store therefore cannot drift from the domain's state
+machine, and the lock makes a worker's report, a reaper's sweep and an
+operator's requeue on the same job serialize instead of interleaving.
+
+- **Stale workers are fenced.** A worker that lost its lease and reports
+  late presents an old attempt number and gets `job.ErrLeaseLost`; the
+  current attempt is untouched. `TestStaleAttemptIsFenced` lets worker A's
+  lease expire, has the reaper hand the job to worker B, then has A
+  succeed, fail and heartbeat: all three are refused and B's attempt is
+  exactly as B left it.
+- **Failure means backoff, then death.** `Fail` makes the job pending
+  again at `now + Backoff.Delay(attempt)` (1s, 2s, 4s, … with jitter by
+  default), keeps the error text (sanitized and cut at 2 KiB), and marks
+  the job `dead` when the attempts are spent or the error is wrapped in
+  `job.Permanent`. Retry times are checked to the microsecond against the
+  database clock with a jitter-free backoff.
+- **Reaping is a failure like any other.** `Store.Reap` finds running jobs
+  whose `lease_until` has passed and expires each in its own transaction,
+  so a long batch does not hold locks over other workers' rows. The
+  attempt counts as failed with the error `lease expired before the
+  attempt finished`; the job retries after the backoff, or dies. A job
+  that finished or heartbeated between the scan and the lock is left
+  alone. `internal/reaper` runs this on a timer in `jobqueued`, sweeps
+  again at once after a full batch, and logs and retries on errors.
+- **Operators.** `Cancel` stops a pending job (a running one is already
+  in flight); `Requeue` gives a dead job fresh attempts, due now, keeping
+  the last error visible.
+
+`TestReapersRaceWorkers` has 40 workers finish their jobs while three
+reapers sweep leases of 3 ms: whatever the interleaving, every attempt
+ends exactly once, and the table agrees with what the workers were told.
+Removing the row lock makes that test fail at once (reapers and workers
+both ending the same attempt).
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
 - [x] **Day 2**: Job domain: state machine, retry policy (exponential backoff + jitter); table tests and fuzzing
 - [x] **Day 3**: Schema and migrations; enqueue with idempotency key, priority and delayed jobs
 - [x] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
-- [ ] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
+- [x] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
 - [ ] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
 - [ ] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
 - [ ] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
