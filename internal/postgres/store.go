@@ -13,12 +13,18 @@ import (
 
 // Store keeps jobs in the jobs table.
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	backoff job.Backoff
+	rnd     job.Rand // nil: the shared math/rand source
 }
 
 // NewStore returns a Store using db. The caller owns db and closes it.
-func NewStore(db *sql.DB) *Store {
-	return &Store{db: db}
+func NewStore(db *sql.DB, opts ...Option) *Store {
+	s := &Store{db: db, backoff: job.DefaultBackoff()}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 const jobColumns = `id, type, payload, state, priority, attempt, max_attempts,
