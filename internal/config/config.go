@@ -25,6 +25,10 @@ type Config struct {
 	// closing the listener. 0 locally; a few seconds behind a load balancer.
 	ShutdownDrain time.Duration
 	LogLevel      string
+	// ReapInterval is how often expired leases are swept. Jobs whose
+	// worker crashed wait at most this long after their lease to be
+	// retried.
+	ReapInterval time.Duration
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -41,6 +45,7 @@ func load(getenv func(string) string) (Config, error) {
 		DBMaxConns:      20,
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        valueOr(getenv("JQ_LOG_LEVEL"), "info"),
+		ReapInterval:    5 * time.Second,
 	}
 
 	var errs []error
@@ -79,6 +84,15 @@ func load(getenv func(string) string) (Config, error) {
 			errs = append(errs, errors.New("JQ_SHUTDOWN_DRAIN: must be a non-negative duration"))
 		} else {
 			cfg.ShutdownDrain = d
+		}
+	}
+
+	if raw := getenv("JQ_REAP_INTERVAL"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 100*time.Millisecond {
+			errs = append(errs, errors.New("JQ_REAP_INTERVAL: must be a duration of at least 100ms"))
+		} else {
+			cfg.ReapInterval = d
 		}
 	}
 

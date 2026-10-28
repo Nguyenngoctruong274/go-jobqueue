@@ -16,6 +16,7 @@ import (
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/config"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/httpapi"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/postgres"
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/reaper"
 )
 
 var errDraining = errors.New("shutting down")
@@ -55,6 +56,21 @@ func run() error {
 		return err
 	}
 	logger.Info("database ready", slog.Int("max_conns", cfg.DBMaxConns))
+	store := postgres.NewStore(db)
+
+	// The reaper runs until shutdown and is awaited before the database
+	// handle is closed (defers run in reverse order).
+	reapCtx, stopReaper := context.WithCancel(context.Background())
+	reaperDone := make(chan struct{})
+	go func() {
+		defer close(reaperDone)
+		_ = reaper.New(store, logger, reaper.Options{Interval: cfg.ReapInterval}).Run(reapCtx)
+	}()
+	defer func() {
+		stopReaper()
+		<-reaperDone
+		logger.Info("reaper stopped")
+	}()
 
 	// Readiness turns false the moment shutdown starts, so load balancers
 	// stop routing new requests while in-flight ones finish.

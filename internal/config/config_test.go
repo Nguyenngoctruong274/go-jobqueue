@@ -21,6 +21,7 @@ func TestLoadDefaults(t *testing.T) {
 		DBMaxConns:      20,
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        "info",
+		ReapInterval:    5 * time.Second,
 	}
 	if cfg != want {
 		t.Fatalf("got %+v, want %+v", cfg, want)
@@ -34,13 +35,15 @@ func TestLoadOverrides(t *testing.T) {
 		"JQ_DB_MAX_CONNS":     "50",
 		"JQ_SHUTDOWN_TIMEOUT": "30s",
 		"JQ_SHUTDOWN_DRAIN":   "5s",
+		"JQ_REAP_INTERVAL":    "1s",
 		"JQ_LOG_LEVEL":        "debug",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.ShutdownTimeout != 30*time.Second ||
-		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 {
+		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 ||
+		cfg.ReapInterval != time.Second {
 		t.Fatalf("unexpected config %+v", cfg)
 	}
 }
@@ -72,8 +75,9 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				"JQ_DATABASE_URL":     "postgres://localhost/jobs",
 				"JQ_SHUTDOWN_TIMEOUT": "0s",
 				"JQ_SHUTDOWN_DRAIN":   "-1s",
+				"JQ_REAP_INTERVAL":    "50ms",
 			},
-			want: []string{"JQ_SHUTDOWN_TIMEOUT: must be positive", "JQ_SHUTDOWN_DRAIN"},
+			want: []string{"JQ_SHUTDOWN_TIMEOUT: must be positive", "JQ_SHUTDOWN_DRAIN", "JQ_REAP_INTERVAL: must be a duration of at least 100ms"},
 		},
 		{
 			name: "unparsable timeout",
