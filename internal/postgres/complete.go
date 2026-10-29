@@ -28,51 +28,50 @@ func WithRand(r job.Rand) Option {
 // fencing token Claim returned; a stale one is refused with
 // job.ErrLeaseLost and the job is left as it is.
 func (s *Store) Succeed(ctx context.Context, id int64, attempt int) error {
-	return s.transition(ctx, "succeed", id, func(j *job.Job, _ time.Time) error {
+	_, err := s.transition(ctx, "succeed", id, func(j *job.Job, _ time.Time) error {
 		return j.Succeed(attempt)
 	})
+	return err
 }
 
 // Fail records a failed attempt. Unless cause is marked job.Permanent or
 // the attempts are used up, the job becomes pending again at now plus the
 // backoff delay; otherwise it is dead. It returns the job as stored.
 func (s *Store) Fail(ctx context.Context, id int64, attempt int, cause error) (job.Job, error) {
-	var out job.Job
-	err := s.transition(ctx, "fail", id, func(j *job.Job, now time.Time) error {
-		if err := j.Fail(attempt, now, cause, s.backoff, s.rnd); err != nil {
-			return err
-		}
-		out = *j
-		return nil
+	return s.transition(ctx, "fail", id, func(j *job.Job, now time.Time) error {
+		return j.Fail(attempt, now, cause, s.backoff, s.rnd)
 	})
-	return out, err
 }
 
 // Heartbeat extends the lease of the attempt a worker holds to now+lease.
 func (s *Store) Heartbeat(ctx context.Context, id int64, attempt int, lease time.Duration) error {
-	return s.transition(ctx, "heartbeat", id, func(j *job.Job, now time.Time) error {
+	_, err := s.transition(ctx, "heartbeat", id, func(j *job.Job, now time.Time) error {
 		return j.Heartbeat(attempt, now, lease)
 	})
+	return err
 }
 
 // Release hands back the attempt a worker holds without finishing it,
 // for a worker shutting down mid-job. The job is due again at once; the
 // attempt still counts, and if it was the last one the job dies.
 func (s *Store) Release(ctx context.Context, id int64, attempt int) error {
-	return s.transition(ctx, "release", id, func(j *job.Job, now time.Time) error {
+	_, err := s.transition(ctx, "release", id, func(j *job.Job, now time.Time) error {
 		return j.Release(attempt, now)
 	})
+	return err
 }
 
-// Cancel stops a pending job from ever running.
-func (s *Store) Cancel(ctx context.Context, id int64) error {
+// Cancel stops a pending job from ever running. It returns the job as
+// stored.
+func (s *Store) Cancel(ctx context.Context, id int64) (job.Job, error) {
 	return s.transition(ctx, "cancel", id, func(j *job.Job, _ time.Time) error {
 		return j.Cancel()
 	})
 }
 
-// Requeue gives a dead job a fresh set of attempts, due now.
-func (s *Store) Requeue(ctx context.Context, id int64) error {
+// Requeue gives a dead job a fresh set of attempts, due now. It returns
+// the job as stored.
+func (s *Store) Requeue(ctx context.Context, id int64) (job.Job, error) {
 	return s.transition(ctx, "requeue", id, func(j *job.Job, now time.Time) error {
 		return j.Requeue(now)
 	})
@@ -114,7 +113,7 @@ func (s *Store) Reap(ctx context.Context, limit int) ([]int64, error) {
 
 	expired := make([]int64, 0, len(ids))
 	for _, id := range ids {
-		err := s.transition(ctx, "expire", id, func(j *job.Job, now time.Time) error {
+		_, err := s.transition(ctx, "expire", id, func(j *job.Job, now time.Time) error {
 			return j.Expire(now, s.backoff, s.rnd)
 		})
 		switch {
@@ -131,14 +130,15 @@ func (s *Store) Reap(ctx context.Context, limit int) ([]int64, error) {
 }
 
 // transition locks the job, applies fn to it at the database's clock and
-// writes the result back, all in one transaction. The lock makes the
+// writes the result back, all in one transaction, and returns the job as
+// written. The lock makes the
 // read-check-write atomic against workers, reapers and operators acting
 // on the same job; fn runs the domain rules, so the store cannot drift
 // from internal/job.
-func (s *Store) transition(ctx context.Context, op string, id int64, fn func(j *job.Job, now time.Time) error) (err error) {
+func (s *Store) transition(ctx context.Context, op string, id int64, fn func(j *job.Job, now time.Time) error) (_ job.Job, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("%s job %d: begin: %w", op, id, err)
+		return job.Job{}, fmt.Errorf("%s job %d: begin: %w", op, id, err)
 	}
 	defer func() {
 		if err != nil {
@@ -150,14 +150,14 @@ func (s *Store) transition(ctx context.Context, op string, id int64, fn func(j *
 	j, err := scanJob(tx.QueryRowContext(ctx,
 		`SELECT `+jobColumns+`, now() FROM jobs WHERE id = $1 FOR UPDATE`, id), &now)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%s job %d: %w", op, id, job.ErrNotFound)
+		return job.Job{}, fmt.Errorf("%s job %d: %w", op, id, job.ErrNotFound)
 	}
 	if err != nil {
-		return fmt.Errorf("%s job %d: %w", op, id, err)
+		return job.Job{}, fmt.Errorf("%s job %d: %w", op, id, err)
 	}
 
 	if err = fn(&j, now); err != nil {
-		return err // the domain error already names the job and operation
+		return job.Job{}, err // the domain error already names the job and operation
 	}
 
 	var leaseUntil, lastError any
@@ -172,10 +172,10 @@ func (s *Store) transition(ctx context.Context, op string, id int64, fn func(j *
 			state = $2, attempt = $3, run_at = $4, lease_until = $5, last_error = $6, updated_at = now()
 		WHERE id = $1`,
 		j.ID, string(j.State), j.Attempt, j.RunAt, leaseUntil, lastError); err != nil {
-		return fmt.Errorf("%s job %d: update: %w", op, id, err)
+		return job.Job{}, fmt.Errorf("%s job %d: update: %w", op, id, err)
 	}
 	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("%s job %d: commit: %w", op, id, err)
+		return job.Job{}, fmt.Errorf("%s job %d: commit: %w", op, id, err)
 	}
-	return nil
+	return j, nil
 }

@@ -352,33 +352,36 @@ func TestCancelAndRequeue(t *testing.T) {
 	ctx := context.Background()
 
 	pending, _ := enqueue(t, s, job.Spec{Type: "t"})
-	if err := s.Cancel(ctx, pending.ID); err != nil {
+	cancelled, err := s.Cancel(ctx, pending.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if j := get(t, s, pending.ID); j.State != job.StateCancelled {
-		t.Fatalf("after Cancel: %+v", j)
+	if j := get(t, s, pending.ID); j.State != job.StateCancelled || !sameJob(cancelled, j) {
+		t.Fatalf("after Cancel: returned %+v, stored %+v", cancelled, j)
 	}
-	if err := s.Cancel(ctx, pending.ID); !errors.Is(err, job.ErrInvalidTransition) {
+	if _, err := s.Cancel(ctx, pending.ID); !errors.Is(err, job.ErrInvalidTransition) {
 		t.Fatalf("cancel twice: %v", err)
 	}
 
 	running := claimOne(t, s, job.Spec{Type: "t", MaxAttempts: 1}, time.Minute)
-	if err := s.Cancel(ctx, running.ID); !errors.Is(err, job.ErrInvalidTransition) {
+	if _, err := s.Cancel(ctx, running.ID); !errors.Is(err, job.ErrInvalidTransition) {
 		t.Fatalf("cancel running: %v", err)
 	}
-	if err := s.Requeue(ctx, running.ID); !errors.Is(err, job.ErrInvalidTransition) {
+	if _, err := s.Requeue(ctx, running.ID); !errors.Is(err, job.ErrInvalidTransition) {
 		t.Fatalf("requeue running: %v", err)
 	}
 	if _, err := s.Fail(ctx, running.ID, 1, errors.New("dead")); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.Requeue(ctx, running.ID); err != nil {
+	requeued, err := s.Requeue(ctx, running.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	j := get(t, s, running.ID)
-	if j.State != job.StatePending || j.Attempt != 0 || j.LastError != "dead" || !j.RunAt.Equal(updatedAt(t, s, j.ID)) {
-		t.Fatalf("after Requeue: %+v", j)
+	if j.State != job.StatePending || j.Attempt != 0 || j.LastError != "dead" || !j.RunAt.Equal(updatedAt(t, s, j.ID)) ||
+		!sameJob(requeued, j) {
+		t.Fatalf("after Requeue: returned %+v, stored %+v", requeued, j)
 	}
 	if got := claimN(t, s, ClaimRequest{Limit: 1, Lease: time.Minute}); len(got) != 1 || got[0].Attempt != 1 {
 		t.Fatalf("requeued job not claimable: %+v", got)
@@ -418,11 +421,12 @@ func TestRelease(t *testing.T) {
 func TestTransitionsOnMissingJob(t *testing.T) {
 	s := newExactStore(t)
 	ctx := context.Background()
+	errOf := func(_ job.Job, err error) error { return err }
 	for name, err := range map[string]error{
 		"succeed":   s.Succeed(ctx, 404, 1),
 		"heartbeat": s.Heartbeat(ctx, 404, 1, time.Minute),
-		"cancel":    s.Cancel(ctx, 404),
-		"requeue":   s.Requeue(ctx, 404),
+		"cancel":    errOf(s.Cancel(ctx, 404)),
+		"requeue":   errOf(s.Requeue(ctx, 404)),
 		"release":   s.Release(ctx, 404, 1),
 	} {
 		if !errors.Is(err, job.ErrNotFound) {
