@@ -1,5 +1,5 @@
-// Package httpapi exposes jobqueued over HTTP. Day 1 serves the probes;
-// the job endpoints are added as the queue grows.
+// Package httpapi exposes jobqueued over HTTP: the probes, and the job
+// endpoints under /v1/jobs for producers and operators.
 package httpapi
 
 import (
@@ -20,20 +20,26 @@ type Options struct {
 	// Ready reports whether the service can take traffic (dependencies up,
 	// not draining). nil means always ready.
 	Ready func(context.Context) error
+	// Jobs serves the /v1/jobs endpoints; nil leaves them out.
+	Jobs Jobs
 }
 
 type api struct {
 	logger *slog.Logger
 	ready  func(context.Context) error
+	jobs   Jobs
 }
 
 // NewHandler returns the root handler of the service.
 func NewHandler(logger *slog.Logger, opts Options) http.Handler {
-	a := &api{logger: logger, ready: opts.Ready}
+	a := &api{logger: logger, ready: opts.Ready, jobs: opts.Jobs}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
+	if a.jobs != nil {
+		a.routeJobs(mux)
+	}
 	return a.withRequestID(a.withAccessLog(mux))
 }
 

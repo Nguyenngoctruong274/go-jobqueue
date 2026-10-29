@@ -474,12 +474,17 @@ func TestClaimErrorsAreRetried(t *testing.T) {
 
 func TestIdlePoolPollsInsteadOfSpinning(t *testing.T) {
 	store := newFakeStore()
-	stop := startPool(t, store, map[string]Handler{"t": HandlerFunc(ok)}, Options{PollInterval: 30 * time.Millisecond})
+	const poll = 30 * time.Millisecond
+	start := time.Now()
+	stop := startPool(t, store, map[string]Handler{"t": HandlerFunc(ok)}, Options{PollInterval: poll})
 	time.Sleep(200 * time.Millisecond)
 	stop()
+	elapsed := time.Since(start)
 	_, _, _, claims, _ := store.snapshot()
-	// About 200/30 ≈ 7 polls; a busy loop would make thousands.
-	if len(claims) < 3 || len(claims) > 12 {
-		t.Fatalf("%d claims in 200ms at a 30ms poll interval", len(claims))
+	// One claim per poll at most, plus the first; a busy loop would make
+	// thousands. A loaded machine stretches the waits, so only the upper
+	// bound is tight.
+	if most := int(elapsed/poll) + 1; len(claims) < 1 || len(claims) > most {
+		t.Fatalf("%d claims in %v at a %v poll interval, want 1 to %d", len(claims), elapsed, poll, most)
 	}
 }

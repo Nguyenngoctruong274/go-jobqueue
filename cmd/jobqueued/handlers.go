@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/job"
-	"github.com/Nguyenngoctruong274/go-jobqueue/internal/postgres"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/worker"
 )
 
@@ -61,11 +60,4 @@ func demoFail(_ context.Context, j job.Job) error {
 		return job.Permanent(err)
 	}
 	return err
-}
-
-// poolStore adapts postgres.Store to the worker pool's Store.
-type poolStore struct{ *postgres.Store }
-
-func (s poolStore) Claim(ctx context.Context, types []string, limit int, lease time.Duration) ([]job.Job, error) {
-	return s.Store.Claim(ctx, postgres.ClaimRequest{Types: types, Limit: limit, Lease: lease})
 }
