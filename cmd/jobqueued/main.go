@@ -17,6 +17,7 @@ import (
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/httpapi"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/postgres"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/reaper"
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/worker"
 )
 
 var errDraining = errors.New("shutting down")
@@ -72,6 +73,31 @@ func run() error {
 		logger.Info("reaper stopped")
 	}()
 
+	// Workers start draining as soon as the shutdown signal arrives, in
+	// parallel with the HTTP drain, and are awaited before the database
+	// handle closes, so every running job is reported or released.
+	if cfg.WorkerConcurrency > 0 {
+		pool, err := worker.New(poolStore{store}, demoHandlers(), logger, worker.Options{
+			Concurrency:  cfg.WorkerConcurrency,
+			Lease:        cfg.WorkerLease,
+			DrainTimeout: cfg.WorkerDrain,
+		})
+		if err != nil {
+			return err
+		}
+		// Cancelled by the signal, or on return if the HTTP server fails.
+		poolCtx, stopPool := context.WithCancel(ctx)
+		poolDone := make(chan struct{})
+		go func() {
+			defer close(poolDone)
+			_ = pool.Run(poolCtx)
+		}()
+		defer func() {
+			stopPool()
+			<-poolDone
+		}()
+	}
+
 	// Readiness turns false the moment shutdown starts, so load balancers
 	// stop routing new requests while in-flight ones finish.
 	var draining atomic.Bool
@@ -115,6 +141,6 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
-	logger.Info("shutdown complete")
+	logger.Info("http server stopped")
 	return nil
 }

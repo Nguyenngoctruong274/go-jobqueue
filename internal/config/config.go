@@ -29,6 +29,15 @@ type Config struct {
 	// worker crashed wait at most this long after their lease to be
 	// retried.
 	ReapInterval time.Duration
+	// WorkerConcurrency is how many jobs this instance runs at once; 0
+	// runs no workers, leaving the API and the reaper.
+	WorkerConcurrency int
+	// WorkerLease is how long a claimed job stays with this instance
+	// without a heartbeat. Heartbeats go out every third of it.
+	WorkerLease time.Duration
+	// WorkerDrain is how long shutdown lets running jobs finish before
+	// cancelling and releasing them.
+	WorkerDrain time.Duration
 }
 
 // Load reads configuration from environment variables, applying defaults
@@ -46,6 +55,10 @@ func load(getenv func(string) string) (Config, error) {
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        valueOr(getenv("JQ_LOG_LEVEL"), "info"),
 		ReapInterval:    5 * time.Second,
+
+		WorkerConcurrency: 10,
+		WorkerLease:       30 * time.Second,
+		WorkerDrain:       10 * time.Second,
 	}
 
 	var errs []error
@@ -93,6 +106,33 @@ func load(getenv func(string) string) (Config, error) {
 			errs = append(errs, errors.New("JQ_REAP_INTERVAL: must be a duration of at least 100ms"))
 		} else {
 			cfg.ReapInterval = d
+		}
+	}
+
+	if raw := getenv("JQ_WORKER_CONCURRENCY"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 || n > 1000 {
+			errs = append(errs, errors.New("JQ_WORKER_CONCURRENCY: must be an integer from 0 to 1000"))
+		} else {
+			cfg.WorkerConcurrency = n
+		}
+	}
+
+	if raw := getenv("JQ_WORKER_LEASE"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < time.Second {
+			errs = append(errs, errors.New("JQ_WORKER_LEASE: must be a duration of at least 1s"))
+		} else {
+			cfg.WorkerLease = d
+		}
+	}
+
+	if raw := getenv("JQ_WORKER_DRAIN"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			errs = append(errs, errors.New("JQ_WORKER_DRAIN: must be a positive duration"))
+		} else {
+			cfg.WorkerDrain = d
 		}
 	}
 

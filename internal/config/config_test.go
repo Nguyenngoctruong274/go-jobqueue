@@ -22,6 +22,10 @@ func TestLoadDefaults(t *testing.T) {
 		ShutdownTimeout: 15 * time.Second,
 		LogLevel:        "info",
 		ReapInterval:    5 * time.Second,
+
+		WorkerConcurrency: 10,
+		WorkerLease:       30 * time.Second,
+		WorkerDrain:       10 * time.Second,
 	}
 	if cfg != want {
 		t.Fatalf("got %+v, want %+v", cfg, want)
@@ -37,13 +41,18 @@ func TestLoadOverrides(t *testing.T) {
 		"JQ_SHUTDOWN_DRAIN":   "5s",
 		"JQ_REAP_INTERVAL":    "1s",
 		"JQ_LOG_LEVEL":        "debug",
+
+		"JQ_WORKER_CONCURRENCY": "0",
+		"JQ_WORKER_LEASE":       "2m",
+		"JQ_WORKER_DRAIN":       "1s",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.HTTPAddr != "127.0.0.1:9090" || cfg.ShutdownTimeout != 30*time.Second ||
 		cfg.ShutdownDrain != 5*time.Second || cfg.LogLevel != "debug" || cfg.DBMaxConns != 50 ||
-		cfg.ReapInterval != time.Second {
+		cfg.ReapInterval != time.Second || cfg.WorkerConcurrency != 0 || cfg.WorkerLease != 2*time.Minute ||
+		cfg.WorkerDrain != time.Second {
 		t.Fatalf("unexpected config %+v", cfg)
 	}
 }
@@ -88,6 +97,16 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 			name: "every error is reported at once",
 			env:  map[string]string{"JQ_LOG_LEVEL": "loud"},
 			want: []string{"JQ_DATABASE_URL: required", `JQ_LOG_LEVEL: unsupported level "loud"`},
+		},
+		{
+			name: "worker settings",
+			env: map[string]string{
+				"JQ_DATABASE_URL":       "postgres://localhost/jobs",
+				"JQ_WORKER_CONCURRENCY": "1001",
+				"JQ_WORKER_LEASE":       "500ms",
+				"JQ_WORKER_DRAIN":       "0s",
+			},
+			want: []string{"JQ_WORKER_CONCURRENCY: must be an integer from 0 to 1000", "JQ_WORKER_LEASE: must be", "JQ_WORKER_DRAIN: must be"},
 		},
 		{
 			name: "pool size",

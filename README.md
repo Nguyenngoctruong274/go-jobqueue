@@ -53,12 +53,13 @@ built so far.
 
 | Package | Responsibility |
 |---|---|
-| `cmd/jobqueued` | Service wiring, graceful shutdown |
+| `cmd/jobqueued` | Service wiring, graceful shutdown, demo handlers |
 | `internal/config` | Environment configuration with validation |
 | `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
 | `internal/httpapi` | Probes; job endpoints from day 7 |
-| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, claim, succeed, fail, heartbeat, reap, cancel, requeue) |
+| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, claim, succeed, fail, heartbeat, release, reap, cancel, requeue) |
 | `internal/reaper` | Timer loop that returns silent workers' jobs to the queue |
+| `internal/worker` | Bounded pool running handlers by job type: heartbeats, panic recovery, graceful drain |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -87,6 +88,9 @@ Or run everything in containers: `make stack`.
 | `JQ_SHUTDOWN_TIMEOUT` | `15s` | Maximum time to finish in-flight requests |
 | `JQ_SHUTDOWN_DRAIN` | `0` | Time `/readyz` reports 503 before the listener closes |
 | `JQ_REAP_INTERVAL` | `5s` | How often expired leases are swept (at least `100ms`) |
+| `JQ_WORKER_CONCURRENCY` | `10` | Jobs this instance runs at once, `0` to `1000`; `0` runs no workers |
+| `JQ_WORKER_LEASE` | `30s` | Lease on a claimed job (at least `1s`); heartbeats renew it every third |
+| `JQ_WORKER_DRAIN` | `10s` | On shutdown, how long running jobs may finish before they are cancelled and released |
 
 Invalid configuration is reported all at once at startup, without echoing
 the database URL (it holds a password).
@@ -97,8 +101,16 @@ the database URL (it holds a password).
   blip does not restart every pod.
 - `GET /readyz`: readiness. Returns 503 while draining or while PostgreSQL
   does not answer a ping.
-- On `SIGTERM`: readiness turns 503, the service waits `JQ_SHUTDOWN_DRAIN`,
-  then shuts the HTTP server down within `JQ_SHUTDOWN_TIMEOUT`.
+- On `SIGTERM`, two drains run side by side:
+  - HTTP: readiness turns 503, the service waits `JQ_SHUTDOWN_DRAIN`, then
+    shuts the HTTP server down within `JQ_SHUTDOWN_TIMEOUT`.
+  - Workers: the pool stops claiming at once, lets running jobs finish for
+    up to `JQ_WORKER_DRAIN`, then cancels the rest and releases their
+    attempts so they run again right away elsewhere.
+
+  The process exits once both are done and the reaper has stopped, so
+  the database handle closes last. Keep the orchestrator's grace period
+  above the larger of the two drains.
 
 ## Job lifecycle
 
@@ -112,6 +124,7 @@ stateDiagram-v2
     pending --> running: claim (RunAt reached, attempt += 1, lease)
     running --> running: heartbeat (extends the lease)
     running --> succeeded: succeed
+    running --> pending: release at shutdown, attempts left (RunAt = now)
     running --> pending: fail / lease expired, attempts left (RunAt = now + backoff)
     running --> dead: fail / lease expired, no attempts left, or permanent error
     pending --> cancelled: cancel
@@ -290,6 +303,61 @@ ends exactly once, and the table agrees with what the workers were told.
 Removing the row lock makes that test fail at once (reapers and workers
 both ending the same attempt).
 
+## Worker pool
+
+`internal/worker` turns the store into a running system. A handler is
+registered per job type:
+
+```go
+pool, err := worker.New(store, map[string]worker.Handler{
+    "email.send": worker.HandlerFunc(func(ctx context.Context, j job.Job) error {
+        var p struct{ To string `json:"to"` }
+        if err := json.Unmarshal(j.Payload, &p); err != nil {
+            return job.Permanent(err) // retrying will not fix the payload
+        }
+        return mailer.Send(ctx, p.To) // a plain error retries with backoff
+    }),
+}, logger, worker.Options{Concurrency: 10, Lease: 30 * time.Second})
+err = pool.Run(ctx) // returns after ctx ends and every job is reported
+```
+
+- **Claims only what it can run.** The pool holds one slot per running
+  handler and claims exactly as many jobs as it has free slots, only of
+  the types it has handlers for. A claimed job never queues in memory
+  while its lease runs down, and a job type no instance handles stays
+  pending instead of failing.
+- **Heartbeats.** Every running job's lease is renewed every `Lease/3`,
+  so a long handler keeps its job and a crashed process loses it within
+  one lease. A transient heartbeat error is retried at the next beat. If
+  the store says the lease is gone (the reaper gave the job to someone
+  else), the handler's context is cancelled and its outcome is dropped:
+  the fencing token would be refused anyway.
+- **Panics are failures.** A panicking handler is recovered, logged with
+  its stack, and reported as a retryable failure; the pool keeps going.
+- **Outcomes survive shutdown.** Claims and reports run on contexts
+  detached from shutdown (bounded at 10s), so a `SIGTERM` cannot abort a
+  claim PostgreSQL already committed or lose a finished job's success.
+- **Graceful drain.** When `ctx` ends the pool claims nothing more and
+  waits up to `DrainTimeout`. Handlers still running are then cancelled
+  and their attempts **released**: the job is pending again at once, with
+  no backoff (the job is not at fault), the attempt still counting toward
+  `MaxAttempts`, as it would after a crash.
+
+`jobqueued` runs the pool with two demo handlers, to try the queue end
+to end before linking your own:
+
+| Type | Payload | Behaviour |
+|---|---|---|
+| `demo.sleep` | `{"ms": 250}` | Waits, then succeeds; stops early when cancelled |
+| `demo.fail` | `{"permanent": false}` | Always fails: retries into the dead-letter queue, or dies at once if permanent |
+
+Tests drive the pool against a scripted store (handlers by type, the
+concurrency bound at every claim, heartbeats, lost leases, panics, claim
+errors, idle polling, both drain outcomes) and against PostgreSQL:
+`TestPoolOnPostgreSQL` runs two pools over 160 jobs that succeed, fail
+once, fail permanently or panic, and checks every job's final state and
+attempt count, and that no attempt ran twice.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -297,7 +365,7 @@ both ending the same attempt).
 - [x] **Day 3**: Schema and migrations; enqueue with idempotency key, priority and delayed jobs
 - [x] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
 - [x] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
-- [ ] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
+- [x] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
 - [ ] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
 - [ ] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
 - [ ] **Day 9**: Metrics (depth, lag, attempts, durations); benchmarks: jobs/s and p99 pickup latency
