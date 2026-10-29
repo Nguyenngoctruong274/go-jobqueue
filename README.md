@@ -56,8 +56,8 @@ built so far.
 | `cmd/jobqueued` | Service wiring, graceful shutdown, demo handlers |
 | `internal/config` | Environment configuration with validation |
 | `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
-| `internal/httpapi` | Probes; job endpoints from day 7 |
-| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, claim, succeed, fail, heartbeat, release, reap, cancel, requeue) |
+| `internal/httpapi` | Probes; `/v1/jobs` endpoints to enqueue, inspect, list, cancel and requeue |
+| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, list, claim, succeed, fail, heartbeat, release, reap, cancel, requeue) |
 | `internal/reaper` | Timer loop that returns silent workers' jobs to the queue |
 | `internal/worker` | Bounded pool running handlers by job type: heartbeats, panic recovery, graceful drain |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
@@ -69,6 +69,9 @@ make up          # PostgreSQL in Docker (databases jobs and jobs_test)
 make run         # jobqueued on :8080
 curl localhost:8080/healthz   # {"status":"ok"}
 curl localhost:8080/readyz    # {"status":"ready"}; 503 if PostgreSQL is down
+curl -XPOST localhost:8080/v1/jobs -H 'Content-Type: application/json' \
+     -d '{"type":"demo.fail","payload":{"permanent":true}}'
+curl 'localhost:8080/v1/jobs?state=dead'   # the dead-letter queue
 make test-db     # unit tests + tests against the real PostgreSQL
 ```
 
@@ -295,7 +298,8 @@ operator's requeue on the same job serialize instead of interleaving.
   again at once after a full batch, and logs and retries on errors.
 - **Operators.** `Cancel` stops a pending job (a running one is already
   in flight); `Requeue` gives a dead job fresh attempts, due now, keeping
-  the last error visible.
+  the last error visible. Both return the job as stored and are exposed
+  over the [HTTP API](#http-api).
 
 `TestReapersRaceWorkers` has 40 workers finish their jobs while three
 reapers sweep leases of 3 ms: whatever the interleaving, every attempt
@@ -358,6 +362,67 @@ errors, idle polling, both drain outcomes) and against PostgreSQL:
 once, fail permanently or panic, and checks every job's final state and
 attempt count, and that no attempt ran twice.
 
+## HTTP API
+
+Producers enqueue and operators inspect jobs over JSON. Errors have one
+shape, `{"error": {"code": "...", "message": "..."}}`; unexpected errors
+are logged with the request id and answered with a bare `internal`.
+
+| Method and path | Does | Answers |
+|---|---|---|
+| `POST /v1/jobs` | Enqueue | `201` + `Location`; `200` with the existing job on a repeated idempotency key; `409 idempotency_conflict`; `422 invalid_job` |
+| `GET /v1/jobs/{id}` | Inspect one job, payload included | `200`; `404 not_found` |
+| `GET /v1/jobs?state=&type=&limit=&cursor=` | List jobs newest first, without payloads | `200` with `jobs` and `next_cursor` |
+| `POST /v1/jobs/{id}/requeue` | Give a dead job fresh attempts, due now | `200`; `409 invalid_state` unless dead |
+| `POST /v1/jobs/{id}/cancel` | Stop a pending job from running | `200`; `409 invalid_state` unless pending |
+
+```bash
+curl -i -XPOST localhost:8080/v1/jobs -H 'Content-Type: application/json' -d '{
+  "type": "email.send",
+  "payload": {"to": "a@example.com"},
+  "priority": 10,
+  "max_attempts": 3,
+  "run_at": "2026-11-01T08:00:00Z",
+  "idempotency_key": "order-42"
+}'
+# HTTP/1.1 201 Created
+# Location: /v1/jobs/1
+# {"id":1,"type":"email.send","state":"pending","payload":{"to":"a@example.com"},
+#  "priority":10,"attempt":0,"max_attempts":3,"run_at":"2026-11-01T08:00:00Z",
+#  "idempotency_key":"order-42","created_at":"..."}
+```
+
+Only `type` is required; the fields follow the [enqueue rules](#enqueueing).
+
+- **Strict bodies.** The body must be one JSON object sent as
+  `application/json`, at most 1 MiB plus a little room for the fields
+  (`413` beyond). Unknown fields are refused, so `"max_attempt": 3` fails
+  with `400` instead of quietly running with the default of 5. Requiring
+  the JSON content type also keeps a plain HTML form from posting jobs.
+- **The dead-letter queue is a filter.** `GET /v1/jobs?state=dead` lists
+  dead jobs with the error that killed them; fix the cause, then requeue
+  them one by one. `last_error` stays until the next failure, so a
+  requeued job still shows why it died.
+- **Keyset pages.** Lists are ordered by id, newest first. Pass
+  `next_cursor` back as `cursor` for the next page; it is absent on the
+  last one. A page costs the same however deep it is, and jobs enqueued
+  while paging never shift it. `limit` defaults to 50, at most 500.
+  Listings leave payloads out (each can be 1 MiB); `GET /v1/jobs/{id}`
+  has it.
+- **One index for listings.** Migration `0002` adds `(state, id)`, so the
+  dead-letter view pages through an index however many finished jobs the
+  table holds. Optional filters are written as `($1 = '' OR state = $1)`;
+  lib/pq plans each statement with its parameters bound, so the unused
+  ones fold away, and a test checks the plan uses the index.
+- **No authentication yet.** Like the probes, the API trusts its network:
+  keep it behind your gateway or a network policy.
+
+Tests cover each endpoint against a scripted store (status codes, error
+mapping, request limits, cursors, internal errors not leaking) and drive a
+job through the API on PostgreSQL: enqueue, a retried enqueue, a reused
+key, inspection, death, the dead-letter listing, requeue, cancel and
+paging.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -366,7 +431,7 @@ attempt count, and that no attempt ran twice.
 - [x] **Day 4**: Claim with `FOR UPDATE SKIP LOCKED` under a lease; concurrency tests: each job claimed once
 - [x] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
 - [x] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
-- [ ] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
+- [x] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
 - [ ] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
 - [ ] **Day 9**: Metrics (depth, lag, attempts, durations); benchmarks: jobs/s and p99 pickup latency
 - [ ] **Day 10**: Final README, design decisions, Docker stack, v1.0.0
