@@ -385,6 +385,36 @@ func TestCancelAndRequeue(t *testing.T) {
 	}
 }
 
+func TestRelease(t *testing.T) {
+	s := newExactStore(t)
+	ctx := context.Background()
+	running := claimOne(t, s, job.Spec{Type: "t", MaxAttempts: 2}, time.Hour)
+
+	if err := s.Release(ctx, running.ID, running.Attempt+1); !errors.Is(err, job.ErrLeaseLost) {
+		t.Fatalf("Release with a stale token: %v, want ErrLeaseLost", err)
+	}
+	if err := s.Release(ctx, running.ID, running.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	released := get(t, s, running.ID)
+	if released.State != job.StatePending || released.Attempt != 1 || !released.LeaseUntil.IsZero() ||
+		!released.RunAt.Equal(updatedAt(t, s, running.ID)) || !strings.Contains(released.LastError, "released") {
+		t.Fatalf("after Release: %+v, want pending, due at the release", released)
+	}
+
+	// Due at once: the next claim takes it as attempt 2, the last one.
+	again := claimN(t, s, ClaimRequest{Limit: 1, Lease: time.Hour})
+	if len(again) != 1 || again[0].Attempt != 2 {
+		t.Fatalf("claim after release: %+v", again)
+	}
+	if err := s.Release(ctx, running.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(t, s, running.ID); got.State != job.StateDead {
+		t.Fatalf("releasing the last attempt left %s, want dead", got.State)
+	}
+}
+
 func TestTransitionsOnMissingJob(t *testing.T) {
 	s := newExactStore(t)
 	ctx := context.Background()
@@ -393,6 +423,7 @@ func TestTransitionsOnMissingJob(t *testing.T) {
 		"heartbeat": s.Heartbeat(ctx, 404, 1, time.Minute),
 		"cancel":    s.Cancel(ctx, 404),
 		"requeue":   s.Requeue(ctx, 404),
+		"release":   s.Release(ctx, 404, 1),
 	} {
 		if !errors.Is(err, job.ErrNotFound) {
 			t.Errorf("%s: %v, want ErrNotFound", name, err)

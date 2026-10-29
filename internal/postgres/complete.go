@@ -55,6 +55,15 @@ func (s *Store) Heartbeat(ctx context.Context, id int64, attempt int, lease time
 	})
 }
 
+// Release hands back the attempt a worker holds without finishing it,
+// for a worker shutting down mid-job. The job is due again at once; the
+// attempt still counts, and if it was the last one the job dies.
+func (s *Store) Release(ctx context.Context, id int64, attempt int) error {
+	return s.transition(ctx, "release", id, func(j *job.Job, now time.Time) error {
+		return j.Release(attempt, now)
+	})
+}
+
 // Cancel stops a pending job from ever running.
 func (s *Store) Cancel(ctx context.Context, id int64) error {
 	return s.transition(ctx, "cancel", id, func(j *job.Job, _ time.Time) error {

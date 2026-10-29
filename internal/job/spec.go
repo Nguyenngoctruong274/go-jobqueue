@@ -36,6 +36,15 @@ var (
 
 var typePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
+// ValidateType reports whether t can name a job type: 1 to 128 of
+// [a-z0-9._-], starting with a letter or digit.
+func ValidateType(t string) error {
+	if !typePattern.MatchString(t) {
+		return errors.New("type: must be 1-128 of [a-z0-9._-], starting with a letter or digit")
+	}
+	return nil
+}
+
 // Spec is what a producer asks to run.
 type Spec struct {
 	// Type selects the handler, e.g. "email.send": lowercase letters,
@@ -59,8 +68,8 @@ type Spec struct {
 // invalid field at once, each wrapped in ErrInvalidSpec.
 func (s Spec) Normalize() (Spec, error) {
 	var errs []error
-	if !typePattern.MatchString(s.Type) {
-		errs = append(errs, errors.New("type: must be 1-128 of [a-z0-9._-], starting with a letter or digit"))
+	if err := ValidateType(s.Type); err != nil {
+		errs = append(errs, err)
 	}
 	if len(s.Payload) == 0 {
 		s.Payload = []byte("{}")

@@ -59,6 +59,9 @@ const MaxErrorBytes = 2048
 // stopped renewing its lease, typically because it crashed.
 var errLeaseExpired = errors.New("lease expired before the attempt finished")
 
+// errReleased is recorded for an attempt its worker gave back unfinished.
+var errReleased = errors.New("released by its worker before the attempt finished")
+
 // Job is one unit of work and the bookkeeping of its attempts.
 //
 // The attempt number doubles as a fencing token: Claim returns it, and a
@@ -163,6 +166,26 @@ func (j *Job) Expire(now time.Time, b Backoff, rnd Rand) error {
 		return fmt.Errorf("job %d: expire: lease until %s: %w", j.ID, j.LeaseUntil.Format(time.RFC3339Nano), ErrLeaseActive)
 	}
 	j.finishAttempt(now, errLeaseExpired, false, b, rnd)
+	return nil
+}
+
+// Release hands a running attempt back without waiting for its lease to
+// run out, as a worker does when it shuts down mid-job. The attempt still
+// counts, as it would if the worker had crashed, but the job is due again
+// at once instead of after a backoff: nothing suggests the job itself is
+// at fault. If that was its last attempt, the job dies.
+func (j *Job) Release(attempt int, now time.Time) error {
+	if err := j.checkOwner("release", attempt); err != nil {
+		return err
+	}
+	j.LastError = ErrorText(errReleased)
+	j.LeaseUntil = time.Time{}
+	if j.Attempt >= j.MaxAttempts {
+		j.State = StateDead
+		return nil
+	}
+	j.State = StatePending
+	j.RunAt = now
 	return nil
 }
 

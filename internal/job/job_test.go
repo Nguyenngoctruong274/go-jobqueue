@@ -58,6 +58,7 @@ func TestTransitionTable(t *testing.T) {
 		{"expire", func(j *Job) error { return j.Expire(t0.Add(lease), noJitter, nil) }},
 		{"cancel", func(j *Job) error { return j.Cancel() }},
 		{"requeue", func(j *Job) error { return j.Requeue(t0) }},
+		{"release", func(j *Job) error { return j.Release(1, t0) }},
 	}
 	// want[state][op] is the state after the op, or the error it returns.
 	type outcome struct {
@@ -68,27 +69,27 @@ func TestTransitionTable(t *testing.T) {
 		StatePending: {
 			"claim": {state: StateRunning}, "heartbeat": {err: ErrLeaseLost}, "succeed": {err: ErrLeaseLost},
 			"fail": {err: ErrLeaseLost}, "expire": {err: ErrInvalidTransition}, "cancel": {state: StateCancelled},
-			"requeue": {err: ErrInvalidTransition},
+			"requeue": {err: ErrInvalidTransition}, "release": {err: ErrLeaseLost},
 		},
 		StateRunning: {
 			"claim": {err: ErrInvalidTransition}, "heartbeat": {state: StateRunning}, "succeed": {state: StateSucceeded},
 			"fail": {state: StatePending}, "expire": {state: StatePending}, "cancel": {err: ErrInvalidTransition},
-			"requeue": {err: ErrInvalidTransition},
+			"requeue": {err: ErrInvalidTransition}, "release": {state: StatePending},
 		},
 		StateSucceeded: {
 			"claim": {err: ErrInvalidTransition}, "heartbeat": {err: ErrLeaseLost}, "succeed": {err: ErrLeaseLost},
 			"fail": {err: ErrLeaseLost}, "expire": {err: ErrInvalidTransition}, "cancel": {err: ErrInvalidTransition},
-			"requeue": {err: ErrInvalidTransition},
+			"requeue": {err: ErrInvalidTransition}, "release": {err: ErrLeaseLost},
 		},
 		StateDead: {
 			"claim": {err: ErrInvalidTransition}, "heartbeat": {err: ErrLeaseLost}, "succeed": {err: ErrLeaseLost},
 			"fail": {err: ErrLeaseLost}, "expire": {err: ErrInvalidTransition}, "cancel": {err: ErrInvalidTransition},
-			"requeue": {state: StatePending},
+			"requeue": {state: StatePending}, "release": {err: ErrLeaseLost},
 		},
 		StateCancelled: {
 			"claim": {err: ErrInvalidTransition}, "heartbeat": {err: ErrLeaseLost}, "succeed": {err: ErrLeaseLost},
 			"fail": {err: ErrLeaseLost}, "expire": {err: ErrInvalidTransition}, "cancel": {err: ErrInvalidTransition},
-			"requeue": {err: ErrInvalidTransition},
+			"requeue": {err: ErrInvalidTransition}, "release": {err: ErrLeaseLost},
 		},
 	}
 	for from, byOp := range want {
@@ -319,6 +320,55 @@ func TestRequeueGivesFreshAttempts(t *testing.T) {
 	}
 }
 
+func TestRelease(t *testing.T) {
+	t.Run("due again at once, attempt counted", func(t *testing.T) {
+		j := pending(3)
+		a := claim(t, j, t0)
+		at := t0.Add(10 * time.Second)
+		if err := j.Release(a, at); err != nil {
+			t.Fatal(err)
+		}
+		if j.State != StatePending || !j.RunAt.Equal(at) || j.Attempt != 1 || !j.LeaseUntil.IsZero() ||
+			!strings.Contains(j.LastError, "released") {
+			t.Fatalf("got %+v", j)
+		}
+		// The next claim is a new attempt with a new token.
+		if got := claim(t, j, at); got != 2 {
+			t.Fatalf("attempt after release = %d, want 2", got)
+		}
+	})
+	t.Run("the last attempt dies", func(t *testing.T) {
+		j := pending(1)
+		a := claim(t, j, t0)
+		if err := j.Release(a, t0); err != nil {
+			t.Fatal(err)
+		}
+		if j.State != StateDead {
+			t.Fatalf("state = %s, want dead", j.State)
+		}
+	})
+	t.Run("a stale token cannot release", func(t *testing.T) {
+		j := pending(3)
+		a := claim(t, j, t0)
+		if err := j.Release(a+1, t0); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("error = %v, want ErrLeaseLost", err)
+		}
+	})
+}
+
+func TestValidateType(t *testing.T) {
+	for _, ok := range []string{"a", "email.send", "report_v2-final", strings.Repeat("x", 128)} {
+		if err := ValidateType(ok); err != nil {
+			t.Errorf("ValidateType(%q) = %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "Email", ".x", "-x", "a b", strings.Repeat("x", 129)} {
+		if err := ValidateType(bad); err == nil {
+			t.Errorf("ValidateType(%q) = nil, want an error", bad)
+		}
+	}
+}
+
 func TestFinal(t *testing.T) {
 	for s, want := range map[State]bool{
 		StatePending: false, StateRunning: false, StateDead: false,
@@ -401,7 +451,7 @@ func FuzzLifecycle(f *testing.F) {
 			}
 			before := *j
 			var err error
-			switch op % 7 {
+			switch op % 8 {
 			case 0:
 				var a int
 				if a, err = j.Claim(now, lease); err == nil {
@@ -419,6 +469,8 @@ func FuzzLifecycle(f *testing.F) {
 				err = j.Cancel()
 			case 6:
 				err = j.Requeue(now)
+			case 7:
+				err = j.Release(token, now)
 			}
 			if err != nil && !reflect.DeepEqual(*j, before) {
 				t.Fatalf("op %d failed with %v but changed the job: %+v -> %+v", op, err, before, *j)
