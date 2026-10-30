@@ -488,3 +488,72 @@ func TestIdlePoolPollsInsteadOfSpinning(t *testing.T) {
 		t.Fatalf("%d claims in %v at a %v poll interval, want 1 to %d", len(claims), elapsed, poll, most)
 	}
 }
+
+// TestWakeUpClaimsAtOnce has a pool idling on a long poll interval. A job
+// is added and a wake-up sent: the job must run well before the poll
+// would have found it. Wake-ups for types the pool does not handle, and
+// those that arrive while it is busy, must not cause extra claims.
+func TestWakeUpClaimsAtOnce(t *testing.T) {
+	store := newFakeStore()
+	wake := make(chan job.Wake, 8)
+	const poll = 2 * time.Second
+	stop := startPool(t, store, map[string]Handler{"t": HandlerFunc(ok)}, Options{PollInterval: poll, Wake: wake})
+
+	time.Sleep(20 * time.Millisecond) // the first, empty claim is done
+	_, _, _, claims, _ := store.snapshot()
+	var before int
+	if len(claims) != 1 {
+		t.Fatalf("%d claims before any wake-up, want 1", len(claims))
+	}
+
+	// A foreign type: ignored, no claim.
+	wake <- job.Wake{Type: "other"}
+	time.Sleep(20 * time.Millisecond)
+	if _, _, _, claims, _ := store.snapshot(); len(claims) != 1 {
+		t.Fatalf("a wake-up for an unhandled type caused a claim (%d claims)", len(claims))
+	}
+
+	store.add(job.Job{Type: "t"})
+	start := time.Now()
+	wake <- job.Wake{Type: "t"}
+	store.waitReports(t, 1)
+	if took := time.Since(start); took > poll/4 {
+		t.Fatalf("job ran %v after the wake-up; the poll interval is %v", took, poll)
+	}
+
+	// A zero Wake (listener reconnected) also claims.
+	store.add(job.Job{Type: "t"})
+	wake <- job.Wake{}
+	store.waitReports(t, 1)
+
+	// A wake-up for a job due later shortens the wait to its RunAt
+	// instead of claiming now or waiting out the poll interval.
+	time.Sleep(10 * time.Millisecond) // let the pool go idle after the last report
+	before = len(claimsOf(store))
+	start = time.Now()
+	wake <- job.Wake{Type: "t", RunAt: time.Now().Add(100 * time.Millisecond)}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(claimsOf(store)); n != before {
+		t.Fatalf("%d claims 50ms after a wake-up due in 100ms, want %d (no early claim)", n, before)
+	}
+	store.add(job.Job{Type: "t"})
+	store.waitReports(t, 1)
+	if took := time.Since(start); took < 100*time.Millisecond || took > poll/4 {
+		t.Fatalf("delayed wake-up claimed after %v, want about 100ms", took)
+	}
+
+	// A closed wake channel leaves the pool polling, not spinning.
+	close(wake)
+	time.Sleep(30 * time.Millisecond)
+	before = len(claimsOf(store))
+	time.Sleep(50 * time.Millisecond)
+	if after := len(claimsOf(store)); after != before {
+		t.Fatalf("pool kept claiming after the wake channel closed: %d -> %d", before, after)
+	}
+	stop()
+}
+
+func claimsOf(s *fakeStore) []claimCall {
+	_, _, _, claims, _ := s.snapshot()
+	return claims
+}

@@ -75,6 +75,13 @@ type Options struct {
 	// DrainTimeout is how long shutdown waits for running handlers before
 	// cancelling them. Default 10s.
 	DrainTimeout time.Duration
+	// Wake announces jobs that became pending, typically from
+	// postgres.Listener. An idle pool claims at once for a job that is
+	// due, and sleeps until RunAt for one that is not (a delayed job or a
+	// retry in backoff), instead of waiting out PollInterval. Optional;
+	// the poll goes on regardless, so a lost wake-up only delays a job,
+	// never loses it.
+	Wake <-chan job.Wake
 }
 
 // Pool claims jobs and runs their handlers.
@@ -222,14 +229,81 @@ func (p *Pool) claimLoop(ctx, handlerCtx context.Context, slots chan struct{}, r
 			p.logger.ErrorContext(ctx, "claim failed", slog.Any("error", err))
 		}
 		if len(jobs) < free {
-			// The queue has no more due jobs for now.
-			select {
-			case <-ctx.Done():
+			// The queue has no more due jobs for now: wait for the poll
+			// interval, or for a wake-up about a type this pool handles.
+			if !p.idle(ctx) {
 				return
-			case <-time.After(p.opts.PollInterval):
 			}
 		}
 	}
+}
+
+// idle waits for the next reason to claim and reports false when ctx
+// ended. It drains the wake channel before waiting, so wake-ups that
+// arrived during the last claim (which already saw their jobs) do not
+// cause an immediate empty claim; a drained wake-up for a job that is not
+// due yet still shortens the wait to that job's RunAt.
+func (p *Pool) idle(ctx context.Context) bool {
+	wait := p.opts.PollInterval
+	for drained := false; !drained; {
+		select {
+		case w, ok := <-p.opts.Wake:
+			if !ok {
+				p.opts.Wake = nil // closed: poll only from now on
+				drained = true
+			} else if d, now := p.dueIn(w); now || d < wait {
+				wait = d
+			}
+		default:
+			drained = true
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case w, ok := <-p.opts.Wake:
+			if !ok {
+				p.opts.Wake = nil
+				continue
+			}
+			d, now := p.dueIn(w)
+			if now {
+				return true
+			}
+			if d < wait {
+				wait = d
+				timer.Reset(d)
+			}
+		}
+	}
+}
+
+// dueIn says whether w calls for a claim right now, and otherwise how long
+// until it does. A type this pool has no handler for never does; neither
+// does it shorten the wait. The margin absorbs small clock skew between
+// this process and the database that stamped RunAt.
+func (p *Pool) dueIn(w job.Wake) (time.Duration, bool) {
+	if w.Type == "" {
+		return 0, true
+	}
+	if !p.handles(w.Type) {
+		return p.opts.PollInterval, false
+	}
+	const margin = 5 * time.Millisecond
+	if d := time.Until(w.RunAt) + margin; d > 0 {
+		return d, false
+	}
+	return 0, true
+}
+
+func (p *Pool) handles(jobType string) bool {
+	_, ok := p.handlers[jobType]
+	return ok
 }
 
 func (p *Pool) claim(ctx context.Context, limit int) ([]job.Job, error) {

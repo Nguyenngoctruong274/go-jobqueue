@@ -15,6 +15,7 @@ import (
 
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/config"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/httpapi"
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/job"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/postgres"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/reaper"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/worker"
@@ -77,10 +78,20 @@ func run() error {
 	// parallel with the HTTP drain, and are awaited before the database
 	// handle closes, so every running job is reported or released.
 	if cfg.WorkerConcurrency > 0 {
+		// Wake-ups shorten the wait for new jobs; without them the pool
+		// still polls, so a listener that cannot connect is not fatal.
+		var wake <-chan job.Wake
+		if l, err := postgres.Listen(startCtx, cfg.DatabaseURL, logger); err != nil {
+			logger.Warn("job listener unavailable; workers will poll only", slog.Any("error", err))
+		} else {
+			defer l.Close()
+			wake = l.C()
+		}
 		pool, err := worker.New(poolStore{store}, demoHandlers(), logger, worker.Options{
 			Concurrency:  cfg.WorkerConcurrency,
 			Lease:        cfg.WorkerLease,
 			DrainTimeout: cfg.WorkerDrain,
+			Wake:         wake,
 		})
 		if err != nil {
 			return err
