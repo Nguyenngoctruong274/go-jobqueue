@@ -45,6 +45,26 @@ func New(t testing.TB, migrate MigrateFunc) *sql.DB {
 // NewEmpty returns a handle scoped to a fresh, empty schema.
 func NewEmpty(t testing.TB) *sql.DB {
 	t.Helper()
+	db, _ := NewEmptyURL(t)
+	return db
+}
+
+// NewURL is New, also returning the schema-scoped URL of the handle, for
+// code that opens its own connections such as a LISTEN subscriber.
+func NewURL(t testing.TB, migrate MigrateFunc) (*sql.DB, string) {
+	t.Helper()
+	db, url := NewEmptyURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := migrate(ctx, db); err != nil {
+		t.Fatalf("testdb: migrate: %v", err)
+	}
+	return db, url
+}
+
+// NewEmptyURL is NewEmpty, also returning the schema-scoped URL.
+func NewEmptyURL(t testing.TB) (*sql.DB, string) {
+	t.Helper()
 	base := os.Getenv(EnvURL)
 	if base == "" {
 		t.Skip(EnvURL + " not set; skipping PostgreSQL tests")
@@ -77,7 +97,7 @@ func NewEmpty(t testing.TB) *sql.DB {
 
 	db := open(ctx, t, u.String())
 	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return db, u.String()
 }
 
 func open(ctx context.Context, t testing.TB, dsn string) *sql.DB {

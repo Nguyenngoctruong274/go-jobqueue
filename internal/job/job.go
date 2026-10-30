@@ -270,3 +270,13 @@ type permanentError struct{ err error }
 
 func (e *permanentError) Error() string { return e.err.Error() }
 func (e *permanentError) Unwrap() error { return e.err }
+
+// Wake announces that a job became pending: it was enqueued, requeued, or
+// failed and is waiting for its retry. Workers use it to claim at once
+// when RunAt has passed, or to sleep until RunAt instead of until their
+// next poll. A zero Wake means "something may be pending": the listener
+// lost its connection for a while and cannot say what.
+type Wake struct {
+	Type  string
+	RunAt time.Time
+}

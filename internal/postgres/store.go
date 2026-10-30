@@ -44,6 +44,30 @@ const keyRaceRetries = 3
 // limit, the key was reused for other work and Enqueue returns
 // job.ErrIdempotencyConflict.
 func (s *Store) Enqueue(ctx context.Context, spec job.Spec) (j job.Job, created bool, err error) {
+	return enqueueWith(ctx, s.db, spec)
+}
+
+// EnqueueTx enqueues inside the caller's transaction, so the job exists if
+// and only if the caller's own changes commit: an order and its
+// "send confirmation" job are written together or not at all. The job is
+// invisible to workers until tx commits, and the wake-up notification
+// fires on commit too. Semantics are otherwise those of Enqueue.
+//
+// If EnqueueTx returns an error the transaction may be aborted (PostgreSQL
+// aborts it on most statement errors); the caller should roll back.
+func (s *Store) EnqueueTx(ctx context.Context, tx *sql.Tx, spec job.Spec) (j job.Job, created bool, err error) {
+	if tx == nil {
+		return job.Job{}, false, errors.New("enqueue: nil transaction")
+	}
+	return enqueueWith(ctx, tx, spec)
+}
+
+// querier is what enqueue needs from *sql.DB and *sql.Tx.
+type querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func enqueueWith(ctx context.Context, q querier, spec job.Spec) (j job.Job, created bool, err error) {
 	spec, err = spec.Normalize()
 	if err != nil {
 		return job.Job{}, false, fmt.Errorf("enqueue: %w", err)
@@ -59,7 +83,7 @@ func (s *Store) Enqueue(ctx context.Context, spec job.Spec) (j job.Job, created 
 	payload := string(spec.Payload)
 
 	for range keyRaceRetries {
-		j, err = scanJob(s.db.QueryRowContext(ctx, `
+		j, err = scanJob(q.QueryRowContext(ctx, `
 			INSERT INTO jobs (type, payload, priority, max_attempts, run_at, idempotency_key)
 			VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6)
 			ON CONFLICT (type, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
@@ -76,7 +100,7 @@ func (s *Store) Enqueue(ctx context.Context, spec job.Spec) (j job.Job, created 
 		// this statement's snapshot predates it, so read the holder in a
 		// new statement, which sees it.
 		var same bool
-		j, err = scanJob(s.db.QueryRowContext(ctx, `
+		j, err = scanJob(q.QueryRowContext(ctx, `
 			SELECT `+jobColumns+`,
 			       payload = $3::jsonb AND priority = $4 AND max_attempts = $5
 			FROM jobs WHERE type = $1 AND idempotency_key = $2`,
