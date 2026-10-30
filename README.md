@@ -45,6 +45,7 @@ flowchart LR
     W2[worker pool] -->|claim| DB
     W1 -->|ack / fail + backoff| DB
     R[reaper] -->|expired leases back to the queue| DB
+    DB -. NOTIFY on commit:<br/>type + run_at .-> W1
     DB -. attempts exhausted .-> DLQ[dead jobs<br/>inspect, requeue]
 ```
 
@@ -57,9 +58,10 @@ built so far.
 | `internal/config` | Environment configuration with validation |
 | `internal/job` | Job lifecycle: states, fenced transitions, retry backoff with jitter (no I/O) |
 | `internal/httpapi` | Probes; `/v1/jobs` endpoints to enqueue, inspect, list, cancel and requeue |
-| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, get, list, claim, succeed, fail, heartbeat, release, reap, cancel, requeue) |
+| `internal/postgres` | Connection pool, embedded migrations, job store (enqueue, enqueue in the caller's tx, get, list, claim, succeed, fail, heartbeat, release, reap, cancel, requeue), `LISTEN` subscriber |
 | `internal/reaper` | Timer loop that returns silent workers' jobs to the queue |
-| `internal/worker` | Bounded pool running handlers by job type: heartbeats, panic recovery, graceful drain |
+| `internal/worker` | Bounded pool running handlers by job type: heartbeats, panic recovery, graceful drain, wake-ups |
+| `test/e2e` | The whole service in one process against PostgreSQL, driven over HTTP |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -211,6 +213,55 @@ that exactly one creates the job and all get its id back.
 fails loudly instead of storing a job the domain could never produce. The
 claim index `(priority DESC, run_at, id) WHERE state = 'pending'` holds
 only pending jobs, so finished ones piling up do not slow claiming down.
+
+### In the caller's transaction
+
+```go
+tx, _ := db.BeginTx(ctx, nil)
+_, _ = tx.ExecContext(ctx, `INSERT INTO orders ...`)
+_, _, err = store.EnqueueTx(ctx, tx, job.Spec{Type: "order.confirm", IdempotencyKey: orderID})
+err = tx.Commit()
+```
+
+`EnqueueTx` writes the job in the caller's own transaction, so the order
+and its confirmation job exist together or not at all: no job for an
+order whose insert rolled back, no order whose job was lost to a crash
+between two commits. The job is invisible to workers until the commit,
+and so is its wake-up (below). `TestEnqueueTxIsAtomicWithTheCallersWrites`
+rolls one transaction back and commits another and checks the job, the
+key and the wake-up follow the transaction each time.
+
+## Wake-ups: LISTEN/NOTIFY instead of tight polling
+
+Polling trades latency for load: a one-second poll means a job waits up
+to a second, and 50 workers polling every 100 ms is 500 queries a second
+on an empty queue. The queue avoids both with a trigger:
+
+```sql
+CREATE TRIGGER jobs_notify_pending
+    AFTER INSERT OR UPDATE OF state ON jobs
+    FOR EACH ROW WHEN (NEW.state = 'pending')
+    EXECUTE FUNCTION jobs_notify_pending();   -- pg_notify('jobqueue_pending', type || ' ' || run_at)
+```
+
+- **Transactional.** `NOTIFY` is delivered when the transaction commits
+  and never if it rolls back, so a wake-up always refers to a committed,
+  claimable job, including one enqueued with `EnqueueTx`.
+- **Carries `run_at`.** A job that is not due yet, such as a retry waiting
+  out its backoff or a delayed job, does not make the pool claim now: the
+  pool sleeps until that `run_at` instead of until its next poll. Before
+  this, a retry with a 50 ms backoff waited for the poll interval.
+- **Filtered by type.** A pool ignores wake-ups for types it has no
+  handler for.
+- **Never relied on.** `postgres.Listener` reconnects on its own and then
+  sends one "look at everything" wake-up; pools keep polling at
+  `PollInterval` regardless, so a lost notification delays a job and
+  never loses it. If the listener cannot connect at startup, `jobqueued`
+  logs it and runs on polling alone.
+
+With the default 1 s poll, a job enqueued over the API against the real
+binary was `succeeded` 61 ms later; the end-to-end suite sets the poll to
+5 s and requires the job to finish within 1 s to prove the wake-up path.
 
 ## Claiming
 
@@ -423,6 +474,19 @@ job through the API on PostgreSQL: enqueue, a retried enqueue, a reused
 key, inspection, death, the dead-letter listing, requeue, cancel and
 paging.
 
+## End to end
+
+`test/e2e` runs the whole service in one process the way `jobqueued`
+wires it: the HTTP API, a worker pool with real handlers, the reaper and
+the `LISTEN` subscriber, against a fresh PostgreSQL schema.
+
+| Test | What it proves |
+|---|---|
+| `TestEnqueueRunsWithinMillisecondsThanksToNotify` | Enqueue over HTTP → handler → `succeeded`, well inside a 5 s poll |
+| `TestRetriesThenDeadLetterThenRequeue` | A failing handler retries on the backoff and succeeds; one that keeps failing lands in `GET /v1/jobs?state=dead`; a permanent failure dies at attempt 1; `POST …/requeue` runs it again with fresh attempts |
+| `TestCrashedWorkerIsReapedAndTheJobRunsAgain` | A running job with a long-expired lease (a crashed worker) is reaped and run by a live pool at attempt 2 |
+| `TestManyProducersEachJobRunsOnce` | 8 producers enqueue 200 jobs, each twice with the same idempotency key: 200 created, 200 duplicates returned, every job runs exactly once |
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -432,7 +496,7 @@ paging.
 - [x] **Day 5**: Ack, fail and retry with backoff; dead-letter queue; reaper for expired leases
 - [x] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
 - [x] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
-- [ ] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
+- [x] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
 - [ ] **Day 9**: Metrics (depth, lag, attempts, durations); benchmarks: jobs/s and p99 pickup latency
 - [ ] **Day 10**: Final README, design decisions, Docker stack, v1.0.0
 
