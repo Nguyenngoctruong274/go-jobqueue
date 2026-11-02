@@ -62,6 +62,7 @@ built so far.
 | `internal/reaper` | Timer loop that returns silent workers' jobs to the queue |
 | `internal/worker` | Bounded pool running handlers by job type: heartbeats, panic recovery, graceful drain, wake-ups |
 | `test/e2e` | The whole service in one process against PostgreSQL, driven over HTTP |
+| `internal/metrics` | Dependency-free Prometheus text exposition (counters, gauges, histograms, scrape-time gauges) |
 | `internal/testdb` | Isolated PostgreSQL schema per test |
 
 ## Quick start
@@ -106,6 +107,7 @@ the database URL (it holds a password).
   blip does not restart every pod.
 - `GET /readyz`: readiness. Returns 503 while draining or while PostgreSQL
   does not answer a ping.
+- `GET /metrics`: Prometheus text format; see [Metrics](#metrics).
 - On `SIGTERM`, two drains run side by side:
   - HTTP: readiness turns 503, the service waits `JQ_SHUTDOWN_DRAIN`, then
     shuts the HTTP server down within `JQ_SHUTDOWN_TIMEOUT`.
@@ -487,6 +489,80 @@ the `LISTEN` subscriber, against a fresh PostgreSQL schema.
 | `TestCrashedWorkerIsReapedAndTheJobRunsAgain` | A running job with a long-expired lease (a crashed worker) is reaped and run by a live pool at attempt 2 |
 | `TestManyProducersEachJobRunsOnce` | 8 producers enqueue 200 jobs, each twice with the same idempotency key: 200 created, 200 duplicates returned, every job runs exactly once |
 
+## Metrics
+
+`GET /metrics` serves Prometheus text. The exposition is written in
+`internal/metrics` (about 350 lines) because `prometheus/client_golang`
+depends on `google.golang.org`, which the build environment of this
+project cannot fetch; the output is deterministic and tested byte for
+byte.
+
+| Metric | Type | Labels | What it tells you |
+|---|---|---|---|
+| `jobqueue_jobs` | gauge | `state` | Jobs in the table per state; `dead` is the dead-letter queue size |
+| `jobqueue_due_jobs` | gauge | | Pending jobs whose `run_at` has passed: the backlog workers could take now |
+| `jobqueue_oldest_due_seconds` | gauge | | How long the longest-waiting due job has waited; rising means workers cannot keep up |
+| `jobqueue_pickup_delay_seconds` | histogram | `type` | `run_at` → claim: the latency of the queue itself |
+| `jobqueue_attempt_duration_seconds` | histogram | `type` | Handler run time per attempt |
+| `jobqueue_attempts_total` | counter | `type`, `result` | `succeeded`, `retried`, `dead`, `released`, `lost`, `report_failed` |
+| `jobqueue_running_jobs` | gauge | `type` | Handlers running right now |
+| `jobqueue_claims_total` | counter | `result` | `jobs`, `empty`, `error`: how often polling finds work |
+| `jobqueue_handler_panics_total` | counter | `type` | Each panic is also a failed attempt |
+| `jobqueue_reaped_leases_total` | counter | | Attempts whose worker went silent |
+| `jobqueue_reaper_sweeps_total` | counter | `result` | Reaper health |
+| `http_requests_total`, `http_request_duration_seconds` | counter, histogram | `method`, `route`, `status` | API traffic, labelled by route pattern so ids never create series |
+| `db_pool_*` | gauges, counters | | Open and in-use connections, waits: a saturated pool shows up here before it shows up as latency |
+| `go_goroutines`, `go_memstats_*` | gauges | | Runtime |
+
+The queue gauges need a `GROUP BY state` over the table and a scan of the
+due jobs; on 100,000 rows that is about 25 ms, so the snapshot is cached
+for one second and several scrapers cost one query. A failed read keeps
+the last snapshot rather than reporting zeros.
+
+Alerts worth having: `jobqueue_oldest_due_seconds > 60` (workers behind),
+`increase(jobqueue_attempts_total{result="dead"}[10m]) > 0` (something
+needs an operator), `increase(jobqueue_reaped_leases_total[10m]) > 0`
+(workers crashing), `jobqueue_claims_total{result="error"}` rising
+(database trouble).
+
+## Benchmarks
+
+Measured on 2 shared vCPUs with PostgreSQL 16 on the same box, default
+settings (`synchronous_commit = on`), `-benchtime 2s`. The numbers show
+where the cost is, not what a real deployment gets.
+
+| Benchmark | Result |
+|---|---|
+| `Enqueue` plain / with key / duplicate key | 0.69 ms / 0.74 ms / 0.58 ms per call |
+| `Claim` batch 1 / 10 / 100 from 50,000 pending | 1.1 ms / 1.4 ms / 13.8 ms per call (900 / 7,100 / 7,200 jobs/s) |
+| `Claim` batch 10, 8 workers in parallel | 0.57 ms per call, 17,700 jobs/s |
+| `Attempt` claim + succeed / claim + fail | 1.9 ms / 2.4 ms |
+| `Heartbeat` | 0.73 ms, 11 allocations |
+| Queue metrics snapshot, 100,000 rows | 25 ms |
+
+`Succeed` and `Heartbeat` are the hot path of every attempt, so they are
+one `UPDATE … WHERE id = $1 AND state = 'running' AND attempt = $2`
+instead of the lock-apply-write transaction the other transitions use;
+the fencing check is the `WHERE` clause. That took `heartbeat` from 1.07
+ms and 83 allocations to 0.73 ms and 11.
+
+End to end (`JQ_LOAD_JOBS=5000 go test -run TestLoad ./test/e2e`): 8
+producers enqueue 5,000 jobs while a pool of 16 drains them.
+
+| Setting | Enqueue rate | End-to-end | Pickup delay p50 / p99 / max |
+|---|---|---|---|
+| `synchronous_commit = on` | 351 jobs/s | 351 jobs/s | 29 ms / 69 ms / 104 ms |
+| `synchronous_commit = off` | 1,011 jobs/s | 413 jobs/s | 3.6 s / 7.1 s / 7.2 s |
+
+Reading it: with synchronous commits every enqueue waits for an fsync, so
+producers are the bottleneck and workers keep up; pickup stays under
+100 ms. With asynchronous commits producers run ahead, the queue builds a
+backlog and pickup delay becomes queueing time, while the workers' ceiling
+on this box is about 400 jobs/s: every job costs a claim and a succeed
+transaction, the CPUs are saturated (0% idle), and nothing is waiting on
+I/O. More cores, or PostgreSQL on its own machine, move that ceiling; the
+per-call numbers above say by how much each part would help.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -497,7 +573,7 @@ the `LISTEN` subscriber, against a fresh PostgreSQL schema.
 - [x] **Day 6**: Worker pool: handlers by job type, bounded concurrency, heartbeats, panic recovery, graceful drain
 - [x] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
 - [x] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
-- [ ] **Day 9**: Metrics (depth, lag, attempts, durations); benchmarks: jobs/s and p99 pickup latency
+- [x] **Day 9**: Metrics (depth, lag, attempts, durations); benchmarks: jobs/s and p99 pickup latency
 - [ ] **Day 10**: Final README, design decisions, Docker stack, v1.0.0
 
 ## License
