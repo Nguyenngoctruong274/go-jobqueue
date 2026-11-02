@@ -9,7 +9,11 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/metrics"
 )
 
 // RequestIDHeader carries the request id in and out of the service.
@@ -22,25 +26,43 @@ type Options struct {
 	Ready func(context.Context) error
 	// Jobs serves the /v1/jobs endpoints; nil leaves them out.
 	Jobs Jobs
+	// Metrics, when set, receives HTTP metrics and is served at GET /metrics.
+	Metrics *metrics.Registry
 }
 
 type api struct {
 	logger *slog.Logger
 	ready  func(context.Context) error
 	jobs   Jobs
+
+	requests *metrics.CounterVec
+	latency  *metrics.HistogramVec
 }
 
 // NewHandler returns the root handler of the service.
 func NewHandler(logger *slog.Logger, opts Options) http.Handler {
-	a := &api{logger: logger, ready: opts.Ready, jobs: opts.Jobs}
+	reg := opts.Metrics
+	if reg == nil {
+		reg = metrics.NewRegistry() // instrument anyway; nothing serves it
+	}
+	a := &api{
+		logger: logger, ready: opts.Ready, jobs: opts.Jobs,
+		requests: reg.NewCounterVec("http_requests_total",
+			"HTTP requests by method, route pattern and status code.", "method", "route", "status"),
+		latency: reg.NewHistogramVec("http_request_duration_seconds",
+			"HTTP request latency by method and route pattern.", metrics.DefaultLatencyBuckets, "method", "route"),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /readyz", a.readyz)
+	if opts.Metrics != nil {
+		mux.Handle("GET /metrics", opts.Metrics.Handler())
+	}
 	if a.jobs != nil {
 		a.routeJobs(mux)
 	}
-	return a.withRequestID(a.withAccessLog(mux))
+	return a.withRequestID(a.instrument(mux))
 }
 
 // healthz answers as long as the process is serving: it is a liveness probe
@@ -94,15 +116,31 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
-func (a *api) withAccessLog(next http.Handler) http.Handler {
+// instrument records the metrics of every request and logs it at debug
+// level. Metrics are labelled with the route pattern, never the raw path,
+// so arbitrary URLs and job ids cannot create new time series.
+func (a *api) instrument(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(rec, r)
+		mux.ServeHTTP(rec, r)
+		elapsed := time.Since(start)
+
+		route := "unmatched"
+		if _, pattern := mux.Handler(r); pattern != "" {
+			if _, path, ok := strings.Cut(pattern, " "); ok {
+				route = path
+			} else {
+				route = pattern
+			}
+		}
+		a.requests.Inc(r.Method, route, strconv.Itoa(rec.status))
+		a.latency.Observe(elapsed.Seconds(), r.Method, route)
+
 		a.logger.DebugContext(r.Context(), "request",
 			slog.String("request_id", RequestID(r.Context())),
 			slog.String("method", r.Method), slog.String("path", r.URL.Path),
-			slog.Int("status", rec.status), slog.Duration("duration", time.Since(start)))
+			slog.Int("status", rec.status), slog.Duration("duration", elapsed))
 	})
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/job"
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/metrics"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -56,6 +57,9 @@ func (s *fakeStore) add(j job.Job) {
 	j.State = job.StatePending
 	if j.MaxAttempts == 0 {
 		j.MaxAttempts = 3
+	}
+	if j.RunAt.IsZero() {
+		j.RunAt = time.Now()
 	}
 	s.queue = append(s.queue, j)
 }
@@ -213,8 +217,8 @@ func TestNewValidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Options{Concurrency: 10, Lease: 30 * time.Second, Heartbeat: 10 * time.Second, PollInterval: time.Second, DrainTimeout: 10 * time.Second}
-	if p.opts != want {
-		t.Fatalf("defaults %+v, want %+v", p.opts, want)
+	if got := p.opts; got.Metrics == nil || (func() Options { got.Metrics = nil; return got }()) != want {
+		t.Fatalf("defaults %+v, want %+v plus private metrics", p.opts, want)
 	}
 }
 
@@ -556,4 +560,50 @@ func TestWakeUpClaimsAtOnce(t *testing.T) {
 func claimsOf(s *fakeStore) []claimCall {
 	_, _, _, claims, _ := s.snapshot()
 	return claims
+}
+
+func TestMetricsCountOutcomes(t *testing.T) {
+	reg := metrics.NewRegistry()
+	m := NewMetrics(reg)
+	store := newFakeStore(
+		job.Job{Type: "t", RunAt: time.Now().Add(-time.Second)},
+		job.Job{Type: "t", MaxAttempts: 1},
+		job.Job{Type: "t"},
+	)
+	var n atomic.Int32
+	stop := startPool(t, store, map[string]Handler{"t": HandlerFunc(func(context.Context, job.Job) error {
+		switch n.Add(1) {
+		case 2:
+			return errors.New("boom")
+		case 3:
+			panic("kaboom")
+		}
+		return nil
+	})}, Options{Metrics: m})
+	store.waitReports(t, 3)
+	stop()
+
+	var out strings.Builder
+	reg.Write(&out)
+	for _, want := range []string{
+		`jobqueue_attempts_total{type="t",result="succeeded"} 1`,
+		`jobqueue_handler_panics_total{type="t"} 1`,
+		`jobqueue_running_jobs{type="t"} 0`,
+		`jobqueue_claims_total{result="jobs"} `,
+		`jobqueue_pickup_delay_seconds_count{type="t"} 3`,
+		`jobqueue_attempt_duration_seconds_count{type="t"} 3`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, out.String())
+		}
+	}
+	// The error and the panic are two failed attempts (the fake always
+	// answers "pending", so both count as retried).
+	if got := m.attempts.Value("t", "retried"); got != 2 {
+		t.Fatalf("retried = %v, want 2", got)
+	}
+	// The first job was due a second before it ran: pickup delay ≥ 1s for it.
+	if !strings.Contains(out.String(), `jobqueue_pickup_delay_seconds_bucket{type="t",le="0.5"} 2`) {
+		t.Errorf("pickup delay histogram does not show one job overdue by 1s:\n%s", out.String())
+	}
 }

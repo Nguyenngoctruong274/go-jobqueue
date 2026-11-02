@@ -16,6 +16,7 @@ import (
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/config"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/httpapi"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/job"
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/metrics"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/postgres"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/reaper"
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/worker"
@@ -60,13 +61,18 @@ func run() error {
 	logger.Info("database ready", slog.Int("max_conns", cfg.DBMaxConns))
 	store := postgres.NewStore(db)
 
+	reg := metrics.NewRegistry()
+	metrics.RegisterRuntime(reg)
+	postgres.RegisterPoolMetrics(reg, db)
+	postgres.RegisterQueueMetrics(reg, db, logger, time.Second)
+
 	// The reaper runs until shutdown and is awaited before the database
 	// handle is closed (defers run in reverse order).
 	reapCtx, stopReaper := context.WithCancel(context.Background())
 	reaperDone := make(chan struct{})
 	go func() {
 		defer close(reaperDone)
-		_ = reaper.New(store, logger, reaper.Options{Interval: cfg.ReapInterval}).Run(reapCtx)
+		_ = reaper.New(store, logger, reaper.Options{Interval: cfg.ReapInterval, Metrics: reg}).Run(reapCtx)
 	}()
 	defer func() {
 		stopReaper()
@@ -92,6 +98,7 @@ func run() error {
 			Lease:        cfg.WorkerLease,
 			DrainTimeout: cfg.WorkerDrain,
 			Wake:         wake,
+			Metrics:      worker.NewMetrics(reg),
 		})
 		if err != nil {
 			return err
@@ -121,7 +128,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready, Jobs: apiStore{store}}),
+		Handler:           httpapi.NewHandler(logger, httpapi.Options{Ready: ready, Jobs: apiStore{store}, Metrics: reg}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Nguyenngoctruong274/go-jobqueue/internal/job"
+	"github.com/Nguyenngoctruong274/go-jobqueue/internal/metrics"
 )
 
 // Handler runs one attempt of a job. Returning nil completes the job; an
@@ -75,6 +76,8 @@ type Options struct {
 	// DrainTimeout is how long shutdown waits for running handlers before
 	// cancelling them. Default 10s.
 	DrainTimeout time.Duration
+	// Metrics, when set, receives the pool's counters and histograms.
+	Metrics *Metrics
 	// Wake announces jobs that became pending, typically from
 	// postgres.Listener. An idle pool claims at once for a job that is
 	// due, and sleeps until RunAt for one that is not (a delayed job or a
@@ -148,6 +151,9 @@ func New(store Store, handlers map[string]Handler, logger *slog.Logger, opts Opt
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if opts.Metrics == nil {
+		opts.Metrics = NewMetrics(metrics.NewRegistry()) // nothing serves it
+	}
 	return &Pool{store: store, handlers: handlers, types: types, logger: logger, opts: opts}, nil
 }
 
@@ -214,6 +220,7 @@ func (p *Pool) claimLoop(ctx, handlerCtx context.Context, slots chan struct{}, r
 		}
 
 		jobs, err := p.claim(ctx, free)
+		p.opts.Metrics.claims.Inc(claimResult(err, len(jobs)))
 		for range free - len(jobs) {
 			<-slots
 		}
@@ -320,6 +327,15 @@ func (p *Pool) process(handlerCtx context.Context, j job.Job) {
 	ctx, cancel := context.WithCancel(handlerCtx)
 	defer cancel()
 
+	m := p.opts.Metrics
+	// Pickup delay: how long the job was due before a worker took it. The
+	// database stamped RunAt; a clock ahead of ours would read negative.
+	if !j.RunAt.IsZero() {
+		m.pickup.Observe(max(0, time.Since(j.RunAt)).Seconds(), j.Type)
+	}
+	m.running.Add(1, j.Type)
+	defer m.running.Add(-1, j.Type)
+
 	var lost atomic.Bool
 	beating := make(chan struct{})
 	go func() {
@@ -335,34 +351,46 @@ func (p *Pool) process(handlerCtx context.Context, j job.Job) {
 	reportCtx, cancelReport := context.WithTimeout(context.WithoutCancel(handlerCtx), reportTimeout)
 	defer cancelReport()
 	var reportErr error
+	took := time.Since(start)
+	m.duration.Observe(took.Seconds(), j.Type)
 	switch {
 	case lost.Load():
 		// Another worker may own the job now; whatever this attempt did,
 		// its report would be refused.
+		m.attempts.Inc(j.Type, "lost")
 		log.Warn("lease lost; outcome dropped", slog.Any("error", err))
 		return
 	case err == nil:
 		reportErr = p.store.Succeed(reportCtx, j.ID, j.Attempt)
 		if reportErr == nil {
-			log.Info("job succeeded", slog.Duration("took", time.Since(start)))
+			m.attempts.Inc(j.Type, "succeeded")
+			log.Info("job succeeded", slog.Duration("took", took))
 		}
 	case handlerCtx.Err() != nil:
 		reportErr = p.store.Release(reportCtx, j.ID, j.Attempt)
 		if reportErr == nil {
+			m.attempts.Inc(j.Type, "released")
 			log.Warn("job interrupted by shutdown; released", slog.Any("error", err))
 		}
 	default:
 		var after job.Job
 		after, reportErr = p.store.Fail(reportCtx, j.ID, j.Attempt, err)
 		if reportErr == nil {
+			result := "retried"
+			if after.State == job.StateDead {
+				result = "dead"
+			}
+			m.attempts.Inc(j.Type, result)
 			log.Warn("job failed", slog.Any("error", err), slog.String("state", string(after.State)),
-				slog.Time("run_at", after.RunAt), slog.Duration("took", time.Since(start)))
+				slog.Time("run_at", after.RunAt), slog.Duration("took", took))
 		}
 	}
 	switch {
 	case errors.Is(reportErr, job.ErrLeaseLost):
+		m.attempts.Inc(j.Type, "lost")
 		log.Warn("lease lost before the outcome was reported", slog.Any("error", reportErr))
 	case reportErr != nil:
+		m.attempts.Inc(j.Type, "report_failed")
 		// The job stays running; the reaper retries it once the lease runs out.
 		log.Error("reporting the outcome failed", slog.Any("error", reportErr))
 	}
@@ -377,6 +405,7 @@ func (p *Pool) call(ctx context.Context, j job.Job, log *slog.Logger) (err error
 	}
 	defer func() {
 		if r := recover(); r != nil {
+			p.opts.Metrics.panics.Inc(j.Type)
 			log.Error("handler panicked", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 			err = fmt.Errorf("handler panicked: %v", r)
 		}
