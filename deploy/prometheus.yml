@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: jobqueued
+    static_configs:
+      - targets: ["jobqueued-1:8080", "jobqueued-2:8080"]

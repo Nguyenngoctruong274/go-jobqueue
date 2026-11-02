@@ -59,13 +59,27 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate compose file
         run: docker compose --profile stack config -q
+      - name: Build image
+        run: docker build -t go-jobqueue:ci .
       - name: Smoke test the stack
         run: |
           docker compose --profile stack up -d --build
           for i in $(seq 1 30); do
-            curl -fsS localhost:8080/readyz && exit 0
+            curl -fsS localhost:8080/readyz && curl -fsS localhost:8081/readyz && break
             sleep 2
           done
+          # Enqueue on instance 1; either instance may run it. The job must
+          # end succeeded, and both instances must expose metrics.
+          id=$(curl -fsS -X POST localhost:8080/v1/jobs -H 'Content-Type: application/json' \
+            -d '{"type":"demo.sleep","payload":{"ms":50}}' | sed -E 's/.*"id":([0-9]+).*/\1/')
+          for i in $(seq 1 15); do
+            curl -fsS localhost:8081/v1/jobs/$id | grep -q '"state":"succeeded"' && ok=1 && break
+            sleep 1
+          done
+          curl -fsS localhost:8080/metrics | grep -q '^jobqueue_jobs{state="succeeded"} ' || ok=
+          curl -fsS localhost:8081/metrics | grep -q '^jobqueue_claims_total' || ok=
+          curl -fsS localhost:9090/-/ready || ok=
+          [ -n "$ok" ] && exit 0
           docker compose --profile stack logs
           exit 1
       - name: Tear down

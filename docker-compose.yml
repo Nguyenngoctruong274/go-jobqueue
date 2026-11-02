@@ -1,5 +1,6 @@
 # `docker compose up -d` starts only PostgreSQL, for local development and
-# tests. `docker compose --profile stack up --build` also runs jobqueued.
+# tests. `docker compose --profile stack up --build` also runs two jobqueued
+# instances and a Prometheus that scrapes them.
 # Credentials here are for local use only.
 services:
   postgres:
@@ -19,19 +20,45 @@ services:
       timeout: 2s
       retries: 15
 
-  jobqueued:
+  # Two instances share the queue, as a real deployment would. Both serve
+  # the API and run workers; the Prometheus below scrapes both.
+  jobqueued-1:
     profiles: ["stack"]
     build: .
-    environment:
+    environment: &jq-env
       JQ_DATABASE_URL: postgres://jobs:jobs@postgres:5432/jobs?sslmode=disable
       JQ_LOG_LEVEL: info
       JQ_SHUTDOWN_DRAIN: 2s
+      JQ_WORKER_CONCURRENCY: 8
     ports:
       - "8080:8080"
     stop_grace_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
+
+  jobqueued-2:
+    profiles: ["stack"]
+    build: .
+    environment: *jq-env
+    ports:
+      - "8081:8080"
+    stop_grace_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    profiles: ["stack"]
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - jobqueued-1
+      - jobqueued-2
 
 volumes:
   pgdata:

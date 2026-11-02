@@ -48,7 +48,7 @@ up: ## Start local dependencies (PostgreSQL)
 	docker compose up -d
 
 .PHONY: stack
-stack: ## Run jobqueued and PostgreSQL in Docker
+stack: ## Run two jobqueued instances, PostgreSQL and Prometheus in Docker
 	docker compose --profile stack up --build
 
 .PHONY: down

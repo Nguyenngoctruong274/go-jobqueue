@@ -1,0 +1,35 @@
+groups:
+  - name: jobqueue
+    rules:
+      - alert: JobQueueBacklogGrowing
+        expr: max(jobqueue_oldest_due_seconds) > 60
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Due jobs have waited over a minute: workers are behind or stuck"
+
+      - alert: JobQueueDeadJobs
+        expr: sum(increase(jobqueue_attempts_total{result="dead"}[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Jobs are landing in the dead-letter queue; an operator should look"
+
+      - alert: JobQueueWorkersCrashing
+        expr: sum(increase(jobqueue_reaped_leases_total[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Leases expired without a report: workers are crashing or stalling"
+
+      - alert: JobQueueClaimErrors
+        expr: sum(rate(jobqueue_claims_total{result="error"}[5m])) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Workers cannot claim from PostgreSQL"
+
+      - alert: JobQueueDBPoolSaturated
+        expr: sum(rate(db_pool_wait_total[5m])) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Callers wait for database connections; raise JQ_DB_MAX_CONNS or add capacity"
