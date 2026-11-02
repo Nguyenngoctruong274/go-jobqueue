@@ -55,6 +55,8 @@ type stack struct {
 	mu   sync.Mutex
 	runs map[string][]int // payload id -> attempts seen by handlers
 	fail map[string]int   // payload id -> attempts that must fail
+	// onLoad handles "load" jobs; the load test sets it.
+	onLoad func(ctx context.Context, j job.Job) error
 }
 
 func newStack(t *testing.T) *stack {
@@ -75,7 +77,8 @@ func newStack(t *testing.T) *stack {
 	pool, err := worker.New(poolStore{s.store}, map[string]worker.Handler{
 		"echo":  worker.HandlerFunc(s.echo),
 		"flaky": worker.HandlerFunc(s.flaky),
-	}, logger, worker.Options{Concurrency: 8, Lease: 2 * time.Second, PollInterval: pollInterval, DrainTimeout: 2 * time.Second, Wake: l.C()})
+		"load":  worker.HandlerFunc(s.load),
+	}, logger, worker.Options{Concurrency: 16, Lease: 2 * time.Second, PollInterval: pollInterval, DrainTimeout: 2 * time.Second, Wake: l.C()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +128,16 @@ func (s *stack) flaky(_ context.Context, j job.Job) error {
 		return fmt.Errorf("attempt %d of %s failed on purpose", j.Attempt, id)
 	}
 	return nil
+}
+
+func (s *stack) load(ctx context.Context, j job.Job) error {
+	s.mu.Lock()
+	fn := s.onLoad
+	s.mu.Unlock()
+	if fn == nil {
+		return job.Permanent(errors.New("no load handler installed"))
+	}
+	return fn(ctx, j)
 }
 
 func (s *stack) attempts(id string) []int {

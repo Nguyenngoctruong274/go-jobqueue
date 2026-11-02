@@ -27,8 +27,25 @@ func WithRand(r job.Rand) Option {
 // Succeed completes the attempt a worker holds. The attempt number is the
 // fencing token Claim returned; a stale one is refused with
 // job.ErrLeaseLost and the job is left as it is.
+//
+// Succeed and Heartbeat are the hot path of every attempt, so they are one
+// statement each instead of the lock-apply-write transaction the other
+// transitions use: the fencing check (running, same attempt) is the
+// UPDATE's WHERE clause, which is exactly what job.Succeed and
+// job.Heartbeat check, and the CHECK constraints guard the rest. When no
+// row matches, the slow path runs the domain transition to report the
+// right error.
 func (s *Store) Succeed(ctx context.Context, id int64, attempt int) error {
-	_, err := s.transition(ctx, "succeed", id, func(j *job.Job, _ time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET state = 'succeeded', lease_until = NULL, updated_at = now()
+		WHERE id = $1 AND state = 'running' AND attempt = $2`, id, attempt)
+	if err != nil {
+		return fmt.Errorf("succeed job %d: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return nil
+	}
+	_, err = s.transition(ctx, "succeed", id, func(j *job.Job, _ time.Time) error {
 		return j.Succeed(attempt)
 	})
 	return err
@@ -45,6 +62,17 @@ func (s *Store) Fail(ctx context.Context, id int64, attempt int, cause error) (j
 
 // Heartbeat extends the lease of the attempt a worker holds to now+lease.
 func (s *Store) Heartbeat(ctx context.Context, id int64, attempt int, lease time.Duration) error {
+	if lease > 0 {
+		res, err := s.db.ExecContext(ctx, `
+			UPDATE jobs SET lease_until = now() + $3 * interval '1 microsecond', updated_at = now()
+			WHERE id = $1 AND state = 'running' AND attempt = $2`, id, attempt, lease.Microseconds())
+		if err != nil {
+			return fmt.Errorf("heartbeat job %d: %w", id, err)
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return nil
+		}
+	}
 	_, err := s.transition(ctx, "heartbeat", id, func(j *job.Job, now time.Time) error {
 		return j.Heartbeat(attempt, now, lease)
 	})

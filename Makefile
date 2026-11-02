@@ -22,6 +22,14 @@ test: ## Run unit tests with the race detector
 test-db: ## Run all tests, including PostgreSQL ones (needs `make up`)
 	JQ_TEST_DATABASE_URL=postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable go test -race -count=1 ./...
 
+.PHONY: bench
+bench: ## Run the PostgreSQL benchmarks (needs `make up`)
+	JQ_TEST_DATABASE_URL=postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable go test -run '^$$' -bench . -benchmem ./internal/postgres
+
+.PHONY: load
+load: ## Enqueue 5000 jobs through the whole pipeline and report throughput and pickup latency
+	JQ_TEST_DATABASE_URL=postgres://jobs:jobs@localhost:5432/jobs_test?sslmode=disable JQ_LOAD_JOBS=5000 go test -count=1 -v -run TestLoad ./test/e2e
+
 .PHONY: cover
 cover: ## Run tests and print total coverage
 	go test -race -coverprofile=coverage.out ./...
