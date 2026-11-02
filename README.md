@@ -10,7 +10,18 @@ A background job queue in Go on PostgreSQL. Jobs are claimed with
 exponential backoff and jitter, and moved to a dead-letter queue when they
 run out of attempts. A worker that crashes loses its lease, not the job.
 
-> 🚧 Built in public as a 10-day series. See the [roadmap](#roadmap) for progress.
+> Built in public in 10 days, one tested increment a day; the
+> [roadmap](#roadmap) is the commit history. **v1.0.0.**
+
+| Problem | How it is solved | Proof |
+|---|---|---|
+| Two workers run the same job | `FOR UPDATE SKIP LOCKED` claim under a lease; the attempt number is a fencing token every report must present | 16 workers drain 2,000 jobs, each claimed once; a stale worker's success, failure and heartbeat are all refused |
+| A worker crashes mid-job | Lease expires, the reaper hands the job back as a failed attempt; it retries with backoff or dies | 40 workers race 3 reapers on 3 ms leases: every attempt ends exactly once; a planted crashed job is reaped and runs again end to end |
+| Retries stampede a sick dependency | Exponential backoff with jitter, exact to the microsecond in tests; `Permanent` errors die at once | Fuzzed backoff bounds; retry times checked against the database clock |
+| A job exists without its data, or the data without its job | `EnqueueTx` writes the job in the caller's transaction; `NOTIFY` fires only on commit | Rolled-back enqueue leaves no job, no key, no wake-up; committed leaves all three |
+| Polling trades latency for load | Trigger-driven `LISTEN/NOTIFY` carrying `run_at`; pools sleep until the next due job | 61 ms enqueue-to-done against the binary with a 1 s poll; a 50 ms backoff retry no longer waits a poll |
+| Producers retry after a timeout | Idempotency key per job type; a duplicate returns the original, a reused key with other data conflicts | 200 jobs enqueued twice each by 8 producers: 200 created, every job ran once |
+| Nobody knows the queue is behind | `/metrics`: due backlog, oldest due age, pickup-delay histogram, dead count; Prometheus alerts in `deploy/` | Scraped from the real stack in CI |
 
 ## Why
 
@@ -81,7 +92,17 @@ make test-db     # unit tests + tests against the real PostgreSQL
 jobqueued applies pending migrations at startup, under an advisory lock so
 that several instances starting together migrate once.
 
-Or run everything in containers: `make stack`.
+Or run the full stack in containers, `make stack`: two `jobqueued`
+instances sharing the queue (`:8080`, `:8081`), PostgreSQL, and a
+Prometheus on `:9090` with the alert rules in `deploy/alerts.yml`. CI
+builds the image, starts this stack, enqueues a job on one instance,
+waits for it to succeed as seen from the other, and checks both
+`/metrics` and the Prometheus readiness.
+
+To use the queue in your own service, import the packages: `postgres.Store`
+to enqueue (also inside your transactions) and `worker.New` with your
+handlers; `cmd/jobqueued` shows the wiring, including the listener, reaper
+and shutdown order.
 
 ## Configuration
 
@@ -563,6 +584,68 @@ transaction, the CPUs are saturated (0% idle), and nothing is waiting on
 I/O. More cores, or PostgreSQL on its own machine, move that ceiling; the
 per-call numbers above say by how much each part would help.
 
+## Design decisions
+
+- **PostgreSQL as the queue, not a broker.** The usual objection is that
+  tables make poor queues. With `SKIP LOCKED` and a partial index on
+  pending rows the claim costs one index range scan however large the
+  table is (1.4 ms for a batch of 10 from 50,000 pending), and the gain is
+  transactional enqueue with the application's own data, which no broker
+  gives. The trade-off is throughput: every attempt is two transactions,
+  and on 2 CPUs the ceiling is about 400 jobs/s. That suits "send the
+  invoice", not "process every click".
+- **Lease plus fencing token instead of a heartbeat table.** A running job
+  carries `lease_until`; heartbeats extend it; the reaper reclaims it. The
+  attempt number travels with every report, so a worker that stalled past
+  its lease and wakes up later cannot overwrite the attempt that replaced
+  it. Alternative considered: `SELECT … FOR UPDATE` held for the whole
+  handler, which would make a crashed worker's job come back on connection
+  loss. It also pins a connection per running job, which caps concurrency
+  at the pool size; leases do not.
+- **Domain rules in Go, restated as `CHECK` constraints.** `internal/job`
+  is the state machine, with no I/O; the store locks a row, applies it and
+  writes back. The constraints (`attempt <= max_attempts`, lease iff
+  running, pending has attempts left) mean a bug in a query cannot store
+  a state the domain would never produce. The two hot transitions,
+  `Succeed` and `Heartbeat`, are single statements whose `WHERE` clause is
+  the fencing check; the slow path is kept only to report the right error.
+- **At-least-once, said out loud.** A handler can run twice: after a lease
+  expires, or after a success whose report was lost. Handlers must be
+  idempotent. The queue could offer exactly-once only for work that
+  happens inside the same database, which is what `EnqueueTx` gives
+  producers; it does not pretend to give it to consumers.
+- **Wake-ups are an optimization, never the mechanism.** `NOTIFY` is lost
+  on reconnect and dropped when the receiver is behind; the poll interval
+  is what guarantees progress. A notification carries `run_at` so delayed
+  work and retries wake the pool at the right time rather than at the next
+  poll, which the end-to-end suite caught as a real gap.
+- **Keep the failed attempt's error, not the handler's stack.** Errors are
+  sanitized (valid UTF-8, no NUL) and cut at 2 KiB on a rune boundary; the
+  stack goes to the log with the job id.
+- **Dependencies kept to `lib/pq`.** The build environment of this project
+  cannot fetch `golang.org/x`, `google.golang.org` or `gopkg.in`, so pgx,
+  Prometheus client and YAML are out. The metrics exposition is 350 lines
+  and tested byte for byte, which is a fair price; the cost is no
+  `pgx`-only features such as batch pipelining.
+
+## Limitations
+
+- Priority is a `SMALLINT` from -100 to 100 with no fairness between
+  priorities: a steady stream of high-priority jobs starves low ones.
+- No per-type concurrency limits or rate limits; a flood of one type
+  fills every worker slot. The policy engine of
+  [go-ratelimiter](https://github.com/Nguyenngoctruong274/go-ratelimiter)
+  is the natural building block.
+- Finished jobs stay in the table. A retention job (`DELETE … WHERE state
+  IN ('succeeded', 'cancelled') AND updated_at < now() - interval …`) is a
+  one-liner but not shipped; the claim index excludes them, so they only
+  cost space and metrics time.
+- Scheduling is one-shot. Cron-style recurring jobs would be a thin layer
+  on top (enqueue the next run on success) and are not included.
+- The queue metrics `GROUP BY` the whole table on every uncached scrape:
+  25 ms at 100,000 rows, cached for 1 s. Past a few million rows, a
+  counter table maintained by trigger would be the next step.
+
 ## Roadmap
 
 - [x] **Day 1**: Scaffold: config, probes, slog, graceful shutdown, Docker, compose with PostgreSQL, CI
@@ -574,7 +657,7 @@ per-call numbers above say by how much each part would help.
 - [x] **Day 7**: HTTP API: enqueue, inspect, list and requeue dead jobs, cancel
 - [x] **Day 8**: Transactional enqueue in the caller's transaction; `LISTEN/NOTIFY` wake-ups; end-to-end tests
 - [x] **Day 9**: Metrics (depth, lag, attempts, durations); benchmarks: jobs/s and p99 pickup latency
-- [ ] **Day 10**: Final README, design decisions, Docker stack, v1.0.0
+- [x] **Day 10**: Final README, design decisions, Docker stack, v1.0.0
 
 ## License
 
